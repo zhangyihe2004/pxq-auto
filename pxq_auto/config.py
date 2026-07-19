@@ -13,7 +13,6 @@ BASE_DIR = Path(os.environ.get("PXQ_AUTO_DIR", Path.home() / ".pxq-auto"))
 CONFIG_PATH = BASE_DIR / "config.json"
 DB_PATH = BASE_DIR / "pxq-auto.db"
 ACCOUNTS_DIR = BASE_DIR / "accounts"
-ARTIFACTS_DIR = BASE_DIR / "artifacts"
 
 DEFAULT_CONFIG = {
     "feishu_app_id": "",
@@ -40,6 +39,7 @@ class SystemConfig:
 class ProjectConfig:
     name: str
     booking_url: str
+    support_seat_picking: bool
 
 
 @dataclass(frozen=True)
@@ -55,10 +55,6 @@ class PurchaseConfig:
     plan_ids: tuple[str, ...]
     audiences: tuple[AudienceConfig, ...]
 
-    @property
-    def quantity(self) -> int:
-        return len(self.audiences)
-
 
 @dataclass(frozen=True)
 class BrowserConfig:
@@ -68,17 +64,11 @@ class BrowserConfig:
 
 
 @dataclass(frozen=True)
-class SafetyConfig:
-    create_order: bool
-
-
-@dataclass(frozen=True)
 class AppConfig:
     project: ProjectConfig
     purchase: PurchaseConfig
     browser: BrowserConfig
-    safety: SafetyConfig
-    config_path: Path
+    create_order: bool
 
     @property
     def state_path(self) -> Path:
@@ -98,33 +88,6 @@ class AppConfig:
         )
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    def render_plan(
-        self,
-        *,
-        status: str,
-        quantity: int | None = None,
-        audiences: tuple[AudienceConfig, ...] | None = None,
-    ) -> str:
-        people = self.purchase.audiences if audiences is None else audiences
-        count = len(people) if quantity is None else quantity
-        lines = [
-            f"演出：{self.project.name}",
-            f"场次：{self.purchase.session}",
-            f"状态：{status}",
-            f"数量：{count}",
-            f"观演人（{len(people[:count])}）：",
-        ]
-        lines.extend(
-            f"✓ {index}. {person.name}｜{person.masked_id}"
-            for index, person in enumerate(people[:count], 1)
-        )
-        lines.append(f"票档优先级（{len(self.purchase.plans)}）：")
-        lines.extend(
-            f"✓ {index}. {name}" for index, name in enumerate(self.purchase.plans, 1)
-        )
-        lines.append("操作：只创建订单，不支付")
-        return "\n".join(lines)
-
 
 def load_system_config() -> SystemConfig:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -137,19 +100,36 @@ def load_system_config() -> SystemConfig:
     raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("config.json 根节点必须是对象")
-    merged = {**DEFAULT_CONFIG, **raw}
-    timeout = merged["browser_timeout_seconds"]
-    concurrent = merged["max_concurrent_accounts"]
-    if not isinstance(timeout, int) or not 5 <= timeout <= 120:
+    expected = set(DEFAULT_CONFIG)
+    missing = expected - set(raw)
+    unknown = set(raw) - expected
+    if missing:
+        raise ValueError(f"config.json 缺少字段：{', '.join(sorted(missing))}")
+    if unknown:
+        raise ValueError(f"config.json 包含未知字段：{', '.join(sorted(unknown))}")
+    for key in ("feishu_app_id", "feishu_app_secret", "feishu_default_chat_id"):
+        if not isinstance(raw[key], str):
+            raise ValueError(f"config.json 字段 {key} 必须是字符串")
+    admins = raw["feishu_admin_open_ids"]
+    if not isinstance(admins, list) or any(
+        not isinstance(item, str) for item in admins
+    ):
+        raise ValueError("feishu_admin_open_ids 必须是字符串数组")
+    for key in ("browser_headless", "create_order_enabled"):
+        if not isinstance(raw[key], bool):
+            raise ValueError(f"config.json 字段 {key} 必须是 true 或 false")
+    timeout = raw["browser_timeout_seconds"]
+    concurrent = raw["max_concurrent_accounts"]
+    if type(timeout) is not int or not 5 <= timeout <= 120:
         raise ValueError("browser_timeout_seconds 必须在 5~120 之间")
-    if not isinstance(concurrent, int) or not 1 <= concurrent <= 20:
+    if type(concurrent) is not int or not 1 <= concurrent <= 20:
         raise ValueError("max_concurrent_accounts 必须在 1~20 之间")
     return SystemConfig(
-        raw=merged,
-        browser_headless=bool(merged["browser_headless"]),
+        raw=raw,
+        browser_headless=raw["browser_headless"],
         browser_timeout_ms=timeout * 1000,
         max_concurrent_accounts=concurrent,
-        create_order_enabled=bool(merged["create_order_enabled"]),
+        create_order_enabled=raw["create_order_enabled"],
     )
 
 
@@ -180,15 +160,9 @@ def build_order_config(
     )
     if not people:
         raise RuntimeError("账号尚未配置观演人")
-    show_id = task["show_id"]
-    session_id = task["session_id"]
-    booking_url = (
-        f"https://m.piaoxingqiu.com/booking/{show_id}"
-        f"?saleShowSessionId={session_id}&seatPickType=SUPPORT_SEAT&showId={show_id}"
-    )
     home = account_home(account["profile_key"])
     return AppConfig(
-        project=ProjectConfig(task["show_name"], booking_url),
+        project=_project_config(task),
         purchase=PurchaseConfig(
             task["session_name"],
             tuple(plan["plan_name"] for plan in plans),
@@ -200,27 +174,32 @@ def build_order_config(
             system.browser_headless,
             system.browser_timeout_ms,
         ),
-        safety=SafetyConfig(system.create_order_enabled),
-        config_path=CONFIG_PATH,
+        create_order=system.create_order_enabled,
     )
 
 
 def build_login_config(task, account, system: SystemConfig) -> AppConfig:
-    show_id = task["show_id"]
-    session_id = task["session_id"]
     home = account_home(account["profile_key"])
     return AppConfig(
-        project=ProjectConfig(
-            task["show_name"],
-            f"https://m.piaoxingqiu.com/booking/{show_id}"
-            f"?saleShowSessionId={session_id}&seatPickType=SUPPORT_SEAT&showId={show_id}",
-        ),
+        project=_project_config(task),
         purchase=PurchaseConfig(task["session_name"], (), (), ()),
         browser=BrowserConfig(
             home / "browser-profile", True, system.browser_timeout_ms
         ),
-        safety=SafetyConfig(False),
-        config_path=CONFIG_PATH,
+        create_order=False,
+    )
+
+
+def _project_config(task) -> ProjectConfig:
+    show_id = task["show_id"]
+    session_id = task["session_id"]
+    support_seat_picking = bool(task["support_seat_picking"])
+    seat_pick_type = "SUPPORT_SEAT" if support_seat_picking else "SUPPORT_NONE"
+    return ProjectConfig(
+        task["show_name"],
+        f"https://m.piaoxingqiu.com/booking/{show_id}"
+        f"?saleShowSessionId={session_id}&seatPickType={seat_pick_type}&showId={show_id}",
+        support_seat_picking,
     )
 
 

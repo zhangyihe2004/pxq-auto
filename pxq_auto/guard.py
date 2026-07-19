@@ -97,7 +97,6 @@ class OrderFirewall:
         self.armed = False
         self.attempt_allowed = False
         self.blocked_requests = 0
-        self.unexpected_posts: set[str] = set()
 
     async def route(self, route: Route, request: Request) -> None:
         if request.method.upper() != "POST":
@@ -116,7 +115,6 @@ class OrderFirewall:
             return
 
         if self.armed:
-            self.unexpected_posts.add(request.url.partition("?")[0])
             self.blocked_requests += 1
             await route.abort("blockedbyclient")
             return

@@ -29,28 +29,25 @@ class AuthGuard:
         root = f"{site.origin}/cyy_gatewayapi/show"
         self.endpoint = f"{root}/buyer/v5/show/{site.show_id}/show_user"
 
-    async def ensure(self, *, interactive: bool) -> None:
+    async def ensure(self) -> None:
         if self.headers and await self.check():
             return
-        await self.refresh(interactive=interactive)
+        await self.refresh()
 
-    async def refresh(self, *, interactive: bool) -> None:
-        while True:
-            try:
-                headers = await capture_authenticated_headers(self.site)
-                self.headers.clear()
-                self.headers.update(headers)
-                if await self.check():
-                    return
-            except AuthenticationRequired:
-                pass
+    async def refresh(self) -> None:
+        try:
+            headers = await capture_authenticated_headers(self.site)
+        except AuthenticationRequired:
+            raise AuthenticationRequired("登录状态无效，请通过飞书重新登录") from None
+        self.headers = headers
+        if not await self.check():
             raise AuthenticationRequired("登录状态无效，请通过飞书重新登录")
 
     async def require_valid(self, *, allow_refresh: bool) -> None:
         if await self.check():
             return
         if allow_refresh:
-            await self.refresh(interactive=True)
+            await self.refresh()
             return
         raise AuthenticationError("登录状态失效，已停止")
 

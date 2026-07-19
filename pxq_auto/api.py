@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 BASE_URL = "https://m.piaoxingqiu.com/cyy_gatewayapi"
@@ -31,7 +33,7 @@ class PxqClient:
     async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
         await self.aclose()
 
-    async def _get(self, path: str, params: dict | None = None) -> dict:
+    async def _get(self, path: str, params: dict | None = None) -> Any:
         resp = await self._http.get(BASE_URL + path, params=params)
         resp.raise_for_status()
         payload = resp.json()
@@ -41,7 +43,10 @@ class PxqClient:
             raise PxqError(
                 f"{path} -> statusCode={payload.get('statusCode')} {payload.get('comments')}"
             )
-        data = payload.get("data")
+        return payload.get("data")
+
+    async def _get_object(self, path: str, params: dict | None = None) -> dict:
+        data = await self._get(path, params)
         if not isinstance(data, dict):
             raise PxqError(f"{path} -> 响应缺少 data 对象")
         return data
@@ -59,7 +64,7 @@ class PxqClient:
         self, keyword: str, page: int = 1, length: int = 10
     ) -> list[dict]:
         path = "/home/pub/v3/show_list/search"
-        data = await self._get(
+        data = await self._get_object(
             path,
             params={"keyword": keyword, "pageNum": page, "length": length},
         )
@@ -69,40 +74,25 @@ class PxqClient:
             if show.get("searchType") == "SHOW"
         ]
 
-    async def sessions_static(self, show_id: str) -> dict:
-        """场次静态信息：showName、sessionName、开赛时间。"""
-        path = f"/show/pub/v3/show/{show_id}/sessions_static_data"
-        data = await self._get(path)
-        self._require_list(data, "sessionVOs", path)
+    async def quick_order_sessions(self, show_id: str) -> list[dict]:
+        """快速购票场次：场次、开售状态及是否支持选座。"""
+        path = f"/show/pub/v5/show/{show_id}/sessions"
+        data = await self._get(path, {"source": "FROM_QUICK_ORDER", "src": "WEB"})
+        if not isinstance(data, list) or not all(
+            isinstance(item, dict) for item in data
+        ):
+            raise PxqError(f"{path} -> 响应缺少 data 数组")
         return data
 
     async def show_dynamic(self, show_id: str) -> dict:
         """演出动态信息：包含官方开售时间与演出状态。"""
-        return await self._get(f"/show/pub/v5/show/{show_id}/dynamic")
+        return await self._get_object(f"/show/pub/v5/show/{show_id}/dynamic")
 
-    async def sessions_dynamic(self, show_id: str) -> dict:
-        """场次动态状态：sessionStatus（ONSALE / LACK_OF_TICKET / ...）。"""
-        path = f"/show/pub/v3/show/{show_id}/sessions_dynamic_data"
-        data = await self._get(path)
-        self._require_list(data, "sessionVOs", path)
-        return data
-
-    async def seat_plans_static(self, show_id: str, session_id: str) -> dict:
-        """票档静态信息：seatPlanName、originalPrice。"""
-        path = (
-            f"/show/pub/v3/show/{show_id}/show_session/{session_id}/"
-            "seat_plans_static_data"
+    async def quick_order_plans(self, show_id: str, session_id: str) -> dict:
+        """快速购票票档：名称、价格、实时可买数和限购数。"""
+        path = f"/show/pub/v5/show/{show_id}/session/{session_id}/seat_plans"
+        data = await self._get_object(
+            path, {"source": "FROM_QUICK_ORDER", "src": "WEB"}
         )
-        data = await self._get(path)
-        self._require_list(data, "seatPlans", path)
-        return data
-
-    async def seat_plans_dynamic(self, show_id: str, session_id: str) -> dict:
-        """票档余票：每个 seatPlanId 的 canBuyCount、saleStarted。"""
-        path = (
-            f"/show/pub/v3/show/{show_id}/show_session/{session_id}/"
-            "seat_plans_dynamic_data"
-        )
-        data = await self._get(path)
         self._require_list(data, "seatPlans", path)
         return data

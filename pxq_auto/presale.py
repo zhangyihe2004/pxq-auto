@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from playwright.async_api import APIResponse
 
 from .auth import AuthGuard, request_context
+from .service import ON_SALE_STATUSES, TERMINAL_STATUSES
 from .site import PiaoxingqiuPage, is_success_payload
 
 
@@ -18,8 +19,6 @@ INTENSIVE_SECONDS = 3
 STATUS_POLL_SECONDS = 0.25
 WARM_POLL_SECONDS = 1.0
 FAR_POLL_SECONDS = 30.0
-SALE_ACTIVE = {"ONSALE", "ON_SALE", "LACK_OF_TICKET"}
-TERMINAL = {"SALE_END", "ENDED", "CANCELLED", "CANCELED", "OFF_SHELF"}
 
 
 @dataclass(frozen=True)
@@ -31,7 +30,7 @@ class SaleState:
 
     @property
     def on_sale(self) -> bool:
-        return self.session_status in SALE_ACTIVE
+        return self.session_status in ON_SALE_STATUSES
 
     @property
     def remaining_seconds(self) -> float | None:
@@ -44,16 +43,16 @@ class SaleGate:
     def __init__(self, site: PiaoxingqiuPage) -> None:
         self.site = site
         self.show_id = site.show_id
-        self.session_id = ""
+        _, self.session_id = site.booking_ids
         root = f"{site.origin}/cyy_gatewayapi/show/pub"
         common = urlencode(request_context())
         self.show_url = f"{root}/v5/show/{self.show_id}/dynamic?{common}"
         self.session_url = (
-            f"{root}/v3/show/{self.show_id}/sessions_dynamic_data?{common}"
+            f"{root}/v5/show/{self.show_id}/sessions?"
+            f"source=FROM_QUICK_ORDER&src=WEB&{common}"
         )
 
     async def fetch(self) -> SaleState:
-        _, self.session_id = await self.site.resolve_booking_ids()
         payloads, now_ms = await self._fetch_payloads((self.show_url, self.session_url))
         dictionaries = [item for payload in payloads for item in _walk_dicts(payload)]
         session_items = self._session_items(dictionaries)
@@ -158,7 +157,7 @@ class SaleGate:
             if remaining is None:
                 raise RuntimeError("等待期间官方接口不再返回开售时间")
             if loop.time() >= next_auth:
-                await auth.ensure(interactive=True)
+                await auth.ensure()
                 next_auth = loop.time() + auth.interval(remaining)
         return state
 
@@ -202,10 +201,13 @@ class SaleGate:
 
     @staticmethod
     def _check_terminal(state: SaleState) -> None:
-        if state.show_status in TERMINAL or state.session_status in TERMINAL:
+        if (
+            state.show_status in TERMINAL_STATUSES
+            or state.session_status in TERMINAL_STATUSES
+        ):
             status = (
                 state.session_status
-                if state.session_status in TERMINAL
+                if state.session_status in TERMINAL_STATUSES
                 else state.show_status
             )
             raise RuntimeError(f"场次已不可售（{status}）")

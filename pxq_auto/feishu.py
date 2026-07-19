@@ -30,7 +30,6 @@ class FeishuError(RuntimeError):
 class IncomingCommand:
     message_id: str
     chat_id: str
-    chat_type: str
     sender_open_id: str
     text: str
     is_admin: bool
@@ -281,7 +280,7 @@ class FeishuGateway:
                     import lark_oapi.ws.client as ws_client_module  # type: ignore[import-untyped]
                 except ImportError as exc:
                     raise FeishuError(
-                        "未安装 lark-oapi，请先执行 pip install -r requirements.txt"
+                        "未安装 lark-oapi，请先执行 python -m pip install -e ."
                     ) from exc
                 ws_client_module.loop = sdk_loop
 
@@ -451,7 +450,6 @@ class FeishuGateway:
         command = IncomingCommand(
             message_id=message_id,
             chat_id=chat_id,
-            chat_type=chat_type,
             sender_open_id=open_id,
             text=text,
             is_admin=is_admin,

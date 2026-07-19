@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -9,6 +10,8 @@ from .db import Database
 
 SHOW_ID_RE = re.compile(r"(?<![0-9a-f])([0-9a-f]{24})(?![0-9a-f])", re.I)
 MIN_INTERVAL = 10
+ON_SALE_STATUSES = {"ONSALE", "ON_SALE", "LACK_OF_TICKET"}
+TERMINAL_STATUSES = {"SALE_END", "ENDED", "CANCELLED", "CANCELED", "OFF_SHELF"}
 
 
 def extract_show_id(value: str) -> str | None:
@@ -41,35 +44,30 @@ class TaskService:
         return await self.client.search_shows(keyword)
 
     async def show_sessions(self, show_id: str) -> tuple[str, list[dict]]:
-        import asyncio
-
-        static, dynamic = await asyncio.gather(
-            self.client.sessions_static(show_id), self.client.show_dynamic(show_id)
+        sessions, dynamic = await asyncio.gather(
+            self.client.quick_order_sessions(show_id),
+            self.client.show_dynamic(show_id),
         )
-        sessions = [dict(session) for session in static["sessionVOs"]]
         for session in sessions:
             if sale_time := _session_sale_time(
                 dynamic, str(session.get("bizShowSessionId") or "")
-            ):
+            ) or _sale_time(session):
                 session["_sale_time_ms"] = sale_time
-        return str(static.get("showName") or show_id), sessions
+        show_name = str(sessions[0].get("showName") or show_id) if sessions else show_id
+        return show_name, sessions
 
     async def plans(self, show_id: str, session_id: str) -> list[dict]:
-        static, dynamic = await self._plan_payloads(show_id, session_id)
-        live = {item["seatPlanId"]: item for item in dynamic["seatPlans"]}
+        payload = await self.client.quick_order_plans(show_id, session_id)
         return [
             {
                 "pid": item["seatPlanId"],
                 "plan_name": str(item.get("seatPlanName") or item["seatPlanId"]),
                 "price": float(item.get("originalPrice") or 0),
-                "can_buy_count": int(
-                    live.get(item["seatPlanId"], {}).get("canBuyCount") or 0
-                ),
-                "sale_started": bool(
-                    live.get(item["seatPlanId"], {}).get("saleStarted")
-                ),
+                "can_buy_count": int(item.get("canBuyCount") or 0),
+                "limitation": int(item.get("limitation") or 0),
+                "sale_started": bool(item.get("saleStarted")),
             }
-            for item in static["seatPlans"]
+            for item in payload["seatPlans"]
         ]
 
     def create_task(
@@ -80,7 +78,7 @@ class TaskService:
         session: dict,
         plans: list[dict],
         interval: int,
-    ) -> tuple[int, bool, list[dict]]:
+    ) -> tuple[int, bool]:
         session_id = str(session["bizShowSessionId"])
         if not plans:
             raise ValueError("该场次当前没有票档")
@@ -89,21 +87,21 @@ class TaskService:
             show_name=show_name,
             session_id=session_id,
             session_name=str(session.get("sessionName") or session_id),
+            support_seat_picking=bool(session.get("supportSeatPicking")),
             interval_sec=max(MIN_INTERVAL, interval),
             sale_time_ms=session.get("_sale_time_ms") or _sale_time(session),
             plans=plans,
         )
-        return task_id, created, plans
+        return task_id, created
 
     async def refresh_task(self, task) -> tuple[str, list[tuple[str, int, bool]]]:
         show_id, session_id = task["show_id"], task["session_id"]
-        sessions, plans = await self._dynamic_payloads(show_id, session_id)
+        sessions, plans = await asyncio.gather(
+            self.client.quick_order_sessions(show_id),
+            self.client.quick_order_plans(show_id, session_id),
+        )
         session = next(
-            (
-                item
-                for item in sessions["sessionVOs"]
-                if item.get("bizShowSessionId") == session_id
-            ),
+            (item for item in sessions if item.get("bizShowSessionId") == session_id),
             None,
         )
         if session is None:
@@ -116,23 +114,9 @@ class TaskService:
             )
             for item in plans["seatPlans"]
         ]
-        return str(session.get("sessionStatus") or ""), snapshot
-
-    async def _plan_payloads(self, show_id: str, session_id: str):
-        import asyncio
-
-        return await asyncio.gather(
-            self.client.seat_plans_static(show_id, session_id),
-            self.client.seat_plans_dynamic(show_id, session_id),
-        )
-
-    async def _dynamic_payloads(self, show_id: str, session_id: str):
-        import asyncio
-
-        return await asyncio.gather(
-            self.client.sessions_dynamic(show_id),
-            self.client.seat_plans_dynamic(show_id, session_id),
-        )
+        return str(
+            session.get("sessionStatus") or session.get("bizSessionStatus") or ""
+        ), snapshot
 
 
 def _sale_time(value: Any) -> int | None:

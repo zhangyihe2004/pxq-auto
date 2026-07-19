@@ -5,6 +5,7 @@ import asyncio
 import logging
 import sqlite3
 import sys
+from pathlib import Path
 
 import httpx
 
@@ -102,8 +103,6 @@ def _doctor() -> None:
         ) from exc
     with sync_playwright() as playwright:
         chromium = playwright.chromium.executable_path
-    from pathlib import Path
-
     if not Path(chromium).is_file():
         raise ValueError(
             "Chromium 未安装，请执行 python -m playwright install chromium"

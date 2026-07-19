@@ -6,12 +6,12 @@ from itertools import groupby
 from playwright.async_api import Locator
 
 from .inventory import Candidate, SeatSelection
-from .site import PiaoxingqiuPage, _is_disabled
+from .site import PiaoxingqiuPage
 
 
 FIND_VENUE_MAP_JS = """() => {
     const container = document.getElementById('vr-container');
-    const cached = window.__pxqLabVenueMap;
+    const cached = window.__pxqAutoVenueMap;
     if (cached?.venueBoxSelf?.mapbox?.getContainer?.() === container) return cached;
     const queue = [document.getElementById('app')?._vnode];
     const seen = new WeakSet();
@@ -24,7 +24,7 @@ FIND_VENUE_MAP_JS = """() => {
             if (typeof value.spliceSelectedZoneIdsByDisableZone === 'function' &&
                 typeof value.venueBoxSelf?.loadSeatsInZoneCodes === 'function' &&
                 value.venueBoxSelf?.mapbox?.getContainer?.() === container) {
-                window.__pxqLabVenueMap = value;
+                window.__pxqAutoVenueMap = value;
                 return value;
             }
         } catch {}
@@ -64,7 +64,7 @@ LOAD_ZONE_JS = (
     const enabled = properties => properties.enable === true ||
         properties.enable === 'true' || properties.enable === 1 ||
         properties.enable === '1';
-    window.__pxqLabMapbox = map;
+    window.__pxqAutoMapbox = map;
     const view = {
         center: [target.x, target.y],
         zoom: Math.min(
@@ -196,13 +196,7 @@ async def select_seats(
         candidates = tuple(grouped)
         await _load_zone(site, candidates[0], candidates)
 
-    async def find_confirm() -> Locator | None:
-        confirm = await site._find_exact("确认选座")
-        if confirm is None:
-            return None
-        return None if await _is_disabled(confirm) else confirm
-
-    confirm = await site._poll(find_confirm)
+    confirm = await site._poll(lambda: site._enabled_exact("确认选座"))
     if confirm is None:
         raise RuntimeError(
             f"点击 {len(selection.candidates)} 个目标座位后等待“确认选座”启用超时"

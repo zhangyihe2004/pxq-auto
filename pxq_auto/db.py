@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     show_name TEXT NOT NULL,
     session_id TEXT NOT NULL,
     session_name TEXT NOT NULL,
+    support_seat_picking INTEGER NOT NULL,
     interval_sec INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     session_status TEXT NOT NULL DEFAULT '',
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS task_plans (
     seat_plan_id TEXT NOT NULL,
     plan_name TEXT NOT NULL,
     price REAL NOT NULL,
+    limitation INTEGER NOT NULL,
     priority INTEGER NOT NULL,
     can_buy_count INTEGER NOT NULL DEFAULT 0,
     sale_started INTEGER NOT NULL DEFAULT 0,
@@ -41,6 +43,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     phone TEXT NOT NULL UNIQUE,
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     profile_key TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'RESERVED',
     order_id TEXT,
     last_error TEXT NOT NULL DEFAULT '',
@@ -76,21 +79,13 @@ class Database:
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 15000")
         self.connection.executescript(SCHEMA)
-        self.connection.execute(
-            """
-            UPDATE accounts
-            SET status = CASE
-                WHEN NOT EXISTS (
-                    SELECT 1 FROM audiences WHERE account_id = accounts.id
-                ) THEN 'NEEDS_AUDIENCE'
-                WHEN NOT EXISTS (
-                    SELECT 1 FROM account_plans WHERE account_id = accounts.id
-                ) THEN 'NEEDS_PLANS'
-                ELSE 'READY'
-            END
-            WHERE status IN ('READY', 'NEEDS_AUDIENCE', 'NEEDS_PLANS')
-            """
-        )
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE accounts SET enabled = 0, status = 'STOPPED'
+                WHERE status = 'RUNNING'
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -103,13 +98,25 @@ class Database:
 
     @staticmethod
     def _next_id(connection: sqlite3.Connection, table: str) -> int:
-        rows = connection.execute(f"SELECT id FROM {table} ORDER BY id").fetchall()
-        expected = 1
-        for row in rows:
-            if row["id"] != expected:
-                break
-            expected += 1
-        return expected
+        if table not in {"tasks", "accounts"}:
+            raise ValueError(f"不支持为表 {table} 分配序号")
+        row = connection.execute(
+            f"""
+            SELECT CASE
+                WHEN EXISTS (SELECT 1 FROM {table} WHERE id = 1)
+                THEN (
+                    SELECT MIN(current.id + 1)
+                    FROM {table} AS current
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {table} AS following
+                        WHERE following.id = current.id + 1
+                    )
+                )
+                ELSE 1
+            END AS id
+            """
+        ).fetchone()
+        return int(row["id"])
 
     # ---- 抢票任务 ----
 
@@ -120,6 +127,7 @@ class Database:
         show_name: str,
         session_id: str,
         session_name: str,
+        support_seat_picking: bool,
         interval_sec: int,
         sale_time_ms: int | None,
         plans: list[dict],
@@ -139,8 +147,9 @@ class Database:
                 """
                 INSERT INTO tasks (
                     id, show_id, show_name, session_id, session_name,
-                    interval_sec, sale_time_ms, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    support_seat_picking, interval_sec, sale_time_ms,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -148,6 +157,7 @@ class Database:
                     show_name,
                     session_id,
                     session_name,
+                    int(support_seat_picking),
                     interval_sec,
                     sale_time_ms,
                     now,
@@ -157,9 +167,9 @@ class Database:
             self.connection.executemany(
                 """
                 INSERT INTO task_plans (
-                    task_id, seat_plan_id, plan_name, price, priority,
+                    task_id, seat_plan_id, plan_name, price, limitation, priority,
                     can_buy_count, sale_started, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -167,6 +177,7 @@ class Database:
                         plan["pid"],
                         plan["plan_name"],
                         plan["price"],
+                        int(plan.get("limitation") or 0),
                         priority,
                         int(plan.get("can_buy_count") or 0),
                         int(bool(plan.get("sale_started"))),
@@ -284,8 +295,11 @@ class Database:
                 """,
                 (account_id, phone, task_id, profile_key(phone), now, now),
             )
+            account = self.get_account(account_id)
+            if account is None:
+                raise RuntimeError("账号创建后无法读取")
             self.connection.commit()
-            return self.get_account(account_id)  # type: ignore[return-value]
+            return account
         except Exception:
             self.connection.rollback()
             raise
@@ -321,10 +335,90 @@ class Database:
             self.connection.execute(
                 """
                 UPDATE accounts
-                SET status = ?, order_id = ?, last_error = ?, updated_at = ?
+                SET status = ?,
+                    enabled = CASE
+                        WHEN ? IN ('NEEDS_LOGIN', 'CREATED', 'UNKNOWN', 'COMPLETE')
+                        THEN 0 ELSE enabled
+                    END,
+                    order_id = ?, last_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, order_id, error, time.time(), account_id),
+                (status, status, order_id, error, time.time(), account_id),
+            ).rowcount
+        )
+
+    def activate_account(self, account_id: int) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            account = self.get_account(account_id)
+            if not account:
+                raise ValueError(f"账号 #{account_id} 不存在")
+            if account["status"] in {"RESERVED", "NEEDS_LOGIN"}:
+                raise ValueError("账号尚未登录，请先重新登录")
+            if account["status"] in {"CREATED", "UNKNOWN"}:
+                raise ValueError("账号存在订单保护状态，请先人工核对并重置")
+            if account["status"] == "COMPLETE":
+                raise ValueError(
+                    f"原观演人均已购买；如需继续，请先发送“配置 {account_id}”更换观演人"
+                )
+            if not self.get_account_plans(account_id) or not self.get_audiences(
+                account_id
+            ):
+                raise ValueError(f"账号配置不完整，请先发送“配置 {account_id}”")
+            self.connection.execute(
+                """
+                UPDATE accounts
+                SET enabled = 1, status = 'READY', last_error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (time.time(), account_id),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def claim_account(self, account_id: int) -> bool:
+        """仅在账号仍启用且空闲时原子取得一次执行权。"""
+        return bool(
+            self.connection.execute(
+                """
+                UPDATE accounts SET status = 'RUNNING', updated_at = ?
+                WHERE id = ? AND enabled = 1 AND status = 'READY'
+                """,
+                (time.time(), account_id),
+            ).rowcount
+        )
+
+    def begin_account_configuration(self, account_id: int) -> bool:
+        """停止空闲账号；已进入抢票流程时拒绝并发修改。"""
+        return bool(
+            self.connection.execute(
+                """
+                UPDATE accounts
+                SET enabled = 0,
+                    status = CASE WHEN status = 'READY' THEN 'STOPPED' ELSE status END,
+                    updated_at = ?
+                WHERE id = ? AND status != 'RUNNING'
+                """,
+                (time.time(), account_id),
+            ).rowcount
+        )
+
+    def deactivate_account(self, account_id: int) -> bool:
+        return bool(
+            self.connection.execute(
+                """
+                UPDATE accounts
+                SET enabled = 0,
+                    status = CASE
+                        WHEN status IN ('READY', 'RUNNING') THEN 'STOPPED'
+                        ELSE status
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (time.time(), account_id),
             ).rowcount
         )
 
@@ -352,19 +446,49 @@ class Database:
             (account_id,),
         ).fetchall()
 
-    def replace_account_plans(self, account_id: int, plan_ids: list[str]) -> None:
-        account = self.get_account(account_id)
-        if not account:
-            raise ValueError(f"账号 #{account_id} 不存在")
-        known = {row["seat_plan_id"] for row in self.get_task_plans(account["task_id"])}
-        if (
-            not plan_ids
-            or len(plan_ids) != len(set(plan_ids))
-            or not set(plan_ids) <= known
-        ):
-            raise ValueError("票档配置为空、重复或包含其他场次的票档")
+    def save_account_config(
+        self,
+        account_id: int,
+        plan_ids: list[str],
+        people: list[tuple[str, str]],
+    ) -> None:
+        """校验并以一个事务同时替换票档、观演人和运行状态。"""
+        if not plan_ids or len(plan_ids) != len(set(plan_ids)):
+            raise ValueError("至少选择一个不重复的票档")
+        if not people or len(people) != len(set(people)):
+            raise ValueError("至少添加一位不重复的观演人")
+        masked_ids = [masked_id for _, masked_id in people]
+        if len(masked_ids) != len(set(masked_ids)):
+            raise ValueError("同一证件不能重复添加")
+
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            account = self.get_account(account_id)
+            if not account:
+                raise ValueError(f"账号 #{account_id} 不存在")
+            if account["status"] in {"RUNNING", "CREATED", "UNKNOWN"}:
+                raise ValueError("账号当前状态不允许修改配置")
+            known = {
+                row["seat_plan_id"] for row in self.get_task_plans(account["task_id"])
+            }
+            if not set(plan_ids) <= known:
+                raise ValueError("票档包含其他场次或已失效的编号")
+            placeholders = ",".join("?" for _ in masked_ids)
+            conflict = self.connection.execute(
+                f"""
+                SELECT a.id, u.masked_id
+                FROM audiences u
+                JOIN accounts a ON a.id = u.account_id
+                WHERE a.task_id = ? AND a.id != ?
+                  AND u.masked_id IN ({placeholders})
+                LIMIT 1
+                """,
+                (account["task_id"], account_id, *masked_ids),
+            ).fetchone()
+            if conflict:
+                raise ValueError(
+                    f"证件 {conflict['masked_id']} 已配置在同场次账号 #{conflict['id']}"
+                )
             self.connection.execute(
                 "DELETE FROM account_plans WHERE account_id = ?", (account_id,)
             )
@@ -374,6 +498,25 @@ class Database:
                     (account_id, plan_id, priority)
                     for priority, plan_id in enumerate(plan_ids, 1)
                 ],
+            )
+            self.connection.execute(
+                "DELETE FROM audiences WHERE account_id = ?", (account_id,)
+            )
+            self.connection.executemany(
+                "INSERT INTO audiences (account_id, position, name, masked_id) VALUES (?, ?, ?, ?)",
+                [
+                    (account_id, position, name, masked_id)
+                    for position, (name, masked_id) in enumerate(people, 1)
+                ],
+            )
+            self.connection.execute(
+                """
+                UPDATE accounts
+                SET enabled = 0, status = 'STOPPED', order_id = NULL,
+                    last_error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (time.time(), account_id),
             )
             self.connection.commit()
         except Exception:
@@ -393,13 +536,6 @@ class Database:
             """,
             (account_id,),
         ).fetchall()
-
-    def configuration_status(self, account_id: int) -> str:
-        if not self.get_audiences(account_id):
-            return "NEEDS_AUDIENCE"
-        if not self.get_account_plans(account_id):
-            return "NEEDS_PLANS"
-        return "READY"
 
     def delete_account(self, account_id: int) -> str | None:
         account = self.get_account(account_id)

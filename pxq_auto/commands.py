@@ -4,35 +4,42 @@ import asyncio
 import shlex
 import time
 
-from .config import mask_phone, remove_account_home, validate_masked_id
+from .config import build_order_config, mask_phone, remove_account_home
+from .configuration import AccountConfigurator
 from .db import Database
 from .engine import AutoEngine
 from .feishu import FeishuGateway, IncomingCommand
 from .guard import PersistentOrderGuard
 from .login import FeishuLoginManager
-from .messages import audience_prompt, next_step, plan_prompt
-from .service import MIN_INTERVAL, TaskService, extract_show_id, parse_numbers
+from .messages import next_step, status_label
+from .service import MIN_INTERVAL, ON_SALE_STATUSES, TaskService, extract_show_id
 
 
 SEARCH_TTL = 900
 HELP = """票星球自动抢票
 
-【任务】
+【创建】
 搜索 <关键词>
 抢票 <搜索序号|showId|链接> [场次 <序号>] [间隔 <秒>]
+
+【查看】
 列表
-暂停 <任务ID> / 恢复 <任务ID> / 删除 <任务ID>
-间隔 <任务ID> [秒]
+详情 <任务ID>
 
 【账号】
 登录 <任务ID>
-票档 <账号ID> [编号列表|全部]
-观演人 <账号ID> [姓名|打码证件号[,姓名|打码证件号]]
-账号 [任务ID]
+配置 <账号ID>
+启动 <账号ID>
+停止 <账号ID>
 解绑 <账号ID>
 重置 <账号ID>  （确认无待支付订单后使用）
 
-机器人只创建待支付订单，不执行支付。群聊使用时请先 @机器人。"""
+【任务】
+间隔 <任务ID> [秒]
+暂停 <任务ID> / 恢复 <任务ID> / 删除 <任务ID>
+
+配置必须发送“完成”后才保存，保存后还需明确“启动”；程序只创建待支付订单，永不支付。
+群聊使用时每条消息都要先 @机器人。"""
 
 
 class CommandWorker:
@@ -51,6 +58,7 @@ class CommandWorker:
         self.engine = engine
         self.login = login
         self.feishu = feishu
+        self.configurator = AccountConfigurator(db, engine.cancel_account)
         self.searches: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 
     async def run_forever(self) -> None:
@@ -69,14 +77,17 @@ class CommandWorker:
         response = await self.login.consume(command)
         if response is not None:
             return response
+        response = self.configurator.consume(command)
+        if response is not None:
+            return response
         try:
             parts = shlex.split(command.text)
         except ValueError as exc:
             return f"指令格式错误：{exc}"
-        if not parts or parts[0] in {"帮助", "help", "?"}:
+        if not parts or parts[0] == "帮助":
             return HELP
         name = parts[0]
-        if name not in {"搜索", "列表", "账号"} and not command.is_admin:
+        if name not in {"搜索", "列表", "详情"} and not command.is_admin:
             return "无操作权限。"
         if name == "搜索":
             return await self._search(command, parts)
@@ -84,22 +95,24 @@ class CommandWorker:
             return await self._create(command, parts)
         if name == "列表":
             return self._tasks()
+        if name == "详情":
+            return self._detail(parts)
         if name in {"暂停", "恢复", "删除"}:
             return await self._task_action(name, parts)
-        if name == "票档":
-            return self._plans(parts)
         if name == "间隔":
             return self._interval(parts)
         if name == "登录":
             return await self._login(command, parts)
-        if name == "观演人":
-            return self._audiences(command, parts)
-        if name == "账号":
-            return self._accounts(parts)
+        if name == "配置":
+            return await self._configure(command, parts)
+        if name == "启动":
+            return self._start_account(parts)
+        if name == "停止":
+            return await self._stop_account(parts)
         if name == "解绑":
-            return await self._detach(command, parts)
+            return await self._detach(parts)
         if name == "重置":
-            return self._reset(command, parts)
+            return self._reset(parts)
         return f"无法识别指令：{name}\n\n{HELP}"
 
     @staticmethod
@@ -121,7 +134,6 @@ class CommandWorker:
                     f"{index}. {show.get('showName', '')}",
                     f"时间：{show.get('showDate') or '未知'}",
                     f"地点：{show.get('cityName', '')} {show.get('venueName', '')}".strip(),
-                    f"showId：{show.get('showId', '')}",
                 )
             )
         lines.extend(("", "发送：抢票 <搜索序号>"))
@@ -130,7 +142,10 @@ class CommandWorker:
     def _target(self, command: IncomingCommand, value: str) -> str | None:
         if value.isdigit() and len(value) <= 3:
             cached = self.searches.get(self._key(command))
-            if not cached or time.monotonic() - cached[0] >= SEARCH_TTL:
+            if not cached:
+                return None
+            if time.monotonic() - cached[0] >= SEARCH_TTL:
+                self.searches.pop(self._key(command), None)
                 return None
             index = int(value)
             if 1 <= index <= len(cached[1]):
@@ -165,14 +180,15 @@ class CommandWorker:
             return "\n".join(lines)
         try:
             session_number = int(options["场次"] or "1")
-            interval = max(MIN_INTERVAL, int(options["间隔"]))
+            requested_interval = int(options["间隔"])
         except ValueError:
             return "场次和间隔必须是数字。"
         if not 1 <= session_number <= len(sessions):
             return f"场次编号必须在 1~{len(sessions)} 之间。"
+        interval = max(MIN_INTERVAL, requested_interval)
         session = sessions[session_number - 1]
         plans = await self.service.plans(show_id, session["bizShowSessionId"])
-        task_id, created, ordered = self.service.create_task(
+        task_id, created = self.service.create_task(
             show_id=show_id,
             show_name=show_name,
             session=session,
@@ -180,61 +196,97 @@ class CommandWorker:
             interval=interval,
         )
         if not created:
-            accounts = self.db.list_accounts(task_id)
-            guide = (
-                f"发送：登录 {task_id} 添加账号。"
-                if not accounts
-                else "发送：列表 查看现有账号和下一步。"
-            )
-            return f"该场次已存在：抢票任务 #{task_id}。\n{guide}"
-        lines = [
-            f"已创建抢票任务 #{task_id}\n"
-            f"演出：{show_name}\n场次：{session.get('sessionName', '')}\n"
-            f"间隔：{interval} 秒",
-            f"票档目录（{len(ordered)}）：",
-        ]
-        lines.extend(
-            f"{number}. {plan['plan_name']}｜¥{plan['price']:g}"
-            for number, plan in enumerate(ordered, 1)
+            return f"该场次已经是任务 #{task_id}，不会重复创建。\n发送：详情 {task_id}"
+        adjusted = (
+            f"（输入 {requested_interval} 秒，已按最低值调整）"
+            if requested_interval < MIN_INTERVAL
+            else ""
         )
-        lines.extend(("", f"下一步发送：登录 {task_id}"))
-        return "\n".join(lines)
+        return (
+            f"已创建任务 #{task_id}\n\n"
+            f"演出：{show_name}\n"
+            f"场次：{session.get('sessionName', '')}\n"
+            f"方式：{'选座' if session.get('supportSeatPicking') else '不选座'}\n"
+            f"间隔：{interval} 秒{adjusted}\n"
+            "账号：0\n状态：等待添加账号\n\n"
+            f"下一步：登录 {task_id}"
+        )
 
     def _tasks(self) -> str:
         tasks = self.db.list_tasks()
         if not tasks:
-            return "抢票任务（0）"
+            return "抢票任务（0）\n下一步：搜索 <关键词>"
         blocks = []
         for task in tasks:
-            plans = self.db.get_task_plans(task["id"])
             accounts = self.db.list_accounts(task["id"])
-            mode = _mode(task, plans)
-            lines = [
-                f"任务 #{task['id']}",
-                f"演出：{task['show_name']}",
-                f"场次：{task['session_name']}",
-                f"状态：{task['status']}｜{mode}",
-                f"账号：{len(accounts)}",
-                f"票档目录（{len(plans)}）：",
-            ]
-            lines.extend(
-                f"✓ {index}. {plan['plan_name']}｜¥{plan['price']:g}"
-                for index, plan in enumerate(plans, 1)
+            enabled = sum(bool(account["enabled"]) for account in accounts)
+            block = (
+                f"任务 #{task['id']}｜{'运行中' if task['status'] == 'active' else '已暂停'}\n"
+                f"演出：{task['show_name']}\n"
+                f"场次：{task['session_name']}\n"
+                f"账号：{len(accounts)}（已启动 {enabled}）\n"
+                f"间隔：{task['interval_sec']} 秒"
             )
-            lines.append("账号明细：")
-            for account in accounts:
-                account_plans = self.db.get_account_plans(account["id"])
-                plan_names = " → ".join(plan["plan_name"] for plan in account_plans)
-                lines.append(
-                    f"✓ #{account['id']} {mask_phone(account['phone'])}｜{account['status']}｜"
-                    f"观演人 {len(self.db.get_audiences(account['id']))}｜"
-                    f"票档 {plan_names or '未配置'}"
-                )
-                lines.append(f"  {next_step(self.db, account['id'])}")
             if not accounts:
-                lines.append(f"下一步：发送“登录 {task['id']}”添加账号。")
-            blocks.append("\n".join(lines))
+                block += f"\n下一步：登录 {task['id']}"
+            blocks.append(block)
         return f"抢票任务（{len(tasks)}）\n\n" + "\n\n".join(blocks)
+
+    def _detail(self, parts: list[str]) -> str:
+        if len(parts) != 2 or not parts[1].isdigit():
+            return "发送：详情 <任务ID>"
+        task_id = int(parts[1])
+        task = self.db.get_task(task_id)
+        if not task:
+            return f"任务 #{task_id} 不存在。"
+        plans = self.db.get_task_plans(task_id)
+        accounts = self.db.list_accounts(task_id)
+        lines = [
+            f"任务 #{task_id}",
+            f"演出：{task['show_name']}",
+            f"场次：{task['session_name']}",
+            f"方式：{'选座' if task['support_seat_picking'] else '不选座'}",
+            f"任务状态：{'运行中' if task['status'] == 'active' else '已暂停'}｜{_mode(task, plans)}",
+            f"间隔：{task['interval_sec']} 秒",
+            "",
+            f"票档目录（{len(plans)}）：",
+        ]
+        for number, plan in enumerate(plans, 1):
+            stock = (
+                f"有票 {plan['can_buy_count']} 张"
+                if plan["sale_started"] and plan["can_buy_count"] > 0
+                else "可售但无票"
+                if plan["sale_started"]
+                else "未开售"
+            )
+            lines.append(f"{number}. {plan['plan_name']}｜¥{plan['price']:g}｜{stock}")
+        lines.extend(("", f"账号（{len(accounts)}）："))
+        for account in accounts:
+            account_plans = self.db.get_account_plans(account["id"])
+            people = self.db.get_audiences(account["id"])
+            lines.extend(
+                (
+                    f"#{account['id']}｜{mask_phone(account['phone'])}｜{status_label(account['status'])}",
+                    "票档："
+                    + (
+                        " → ".join(plan["plan_name"] for plan in account_plans)
+                        if account_plans
+                        else "未配置"
+                    ),
+                    f"观演人（{len(people)}）：",
+                    *(
+                        f"  {index}. {person['name']}｜{person['masked_id']}"
+                        for index, person in enumerate(people, 1)
+                    ),
+                    next_step(self.db, account["id"]),
+                    "",
+                )
+            )
+        if not accounts:
+            lines.append(f"下一步：登录 {task_id}")
+        elif lines[-1] == "":
+            lines.pop()
+        return "\n".join(lines)
 
     async def _task_action(self, name: str, parts: list[str]) -> str:
         if len(parts) != 2 or not parts[1].isdigit():
@@ -242,147 +294,114 @@ class CommandWorker:
         task_id = int(parts[1])
         if name == "删除":
             if not self.db.get_task(task_id):
-                return f"抢票任务 #{task_id} 不存在。"
+                return f"任务 #{task_id} 不存在。"
+            self.configurator.cancel_task_sessions(task_id)
             await self.engine.cancel_task(task_id)
             for account in self.db.list_accounts(task_id):
                 await self.login.cancel_account(account["id"])
             keys = self.db.delete_task(task_id)
             for key in keys:
                 remove_account_home(key)
-            return f"已删除抢票任务 #{task_id} 及其全部账号资料。"
+            return f"已删除任务 #{task_id} 及其全部账号资料。"
         status = "paused" if name == "暂停" else "active"
         if not self.db.set_task_status(task_id, status):
-            return f"抢票任务 #{task_id} 不存在。"
+            return f"任务 #{task_id} 不存在。"
         if status == "paused":
             await self.engine.cancel_task(task_id)
-        return f"已{name}抢票任务 #{task_id}。"
-
-    def _plans(self, parts: list[str]) -> str:
-        if len(parts) not in {2, 3} or not parts[1].isdigit():
-            return "先发送：票档 <账号ID>\n查看目录后再选择。"
-        account_id = int(parts[1])
-        account = self.db.get_account(account_id)
-        if not account:
-            return f"账号 #{account_id} 不存在。"
-        if len(parts) == 2:
-            return plan_prompt(self.db, account_id)
-        if account["status"] == "RUNNING":
-            return "账号正在抢票，请先暂停所属任务。"
-        plans = self.db.get_task_plans(account["task_id"])
-        try:
-            numbers = (
-                list(range(1, len(plans) + 1))
-                if parts[2].lower() in {"all", "全部"}
-                else parse_numbers(parts[2], len(plans))
-            )
-        except ValueError as exc:
-            return f"{exc}\n\n{plan_prompt(self.db, account_id)}"
-        ids = [plans[number - 1]["seat_plan_id"] for number in numbers]
-        self.db.replace_account_plans(account_id, ids)
-        self._refresh_account_status(account_id)
-        names = " → ".join(plans[number - 1]["plan_name"] for number in numbers)
-        return (
-            f"账号 #{account_id} 已更新票档优先级：{names}\n\n"
-            f"{plan_prompt(self.db, account_id)}\n\n{next_step(self.db, account_id)}"
-        )
+        else:
+            self.engine.next_poll[task_id] = 0
+        return f"已{name}任务 #{task_id}。"
 
     def _interval(self, parts: list[str]) -> str:
         if len(parts) not in {2, 3} or not parts[1].isdigit():
-            return "先发送：间隔 <任务ID>\n查看当前值后再修改。"
+            return "发送：间隔 <任务ID> [秒]"
         task_id = int(parts[1])
         task = self.db.get_task(task_id)
         if not task:
-            return f"抢票任务 #{task_id} 不存在。"
+            return f"任务 #{task_id} 不存在。"
         if len(parts) == 2:
             return (
-                f"任务 #{task_id}\n当前间隔：{task['interval_sec']} 秒\n\n"
-                f"发送：间隔 {task_id} <秒>（最低 {MIN_INTERVAL} 秒）"
+                f"任务 #{task_id} 当前间隔：{task['interval_sec']} 秒\n"
+                f"修改：间隔 {task_id} <秒>（最低 {MIN_INTERVAL} 秒）"
             )
         if not parts[2].isdigit():
             return "间隔必须是整数秒。"
         requested = int(parts[2])
         interval = max(MIN_INTERVAL, requested)
-        if not self.db.set_task_interval(task_id, interval):
-            return f"抢票任务 #{task_id} 不存在。"
+        self.db.set_task_interval(task_id, interval)
         self.engine.next_poll[task_id] = 0
-        adjusted = (
-            f"（输入 {requested} 秒，已按最低值调整）"
-            if requested < MIN_INTERVAL
-            else ""
-        )
-        return f"已更新任务 #{task_id}\n间隔：{interval} 秒{adjusted}"
+        adjusted = "（已按最低值调整）" if requested < MIN_INTERVAL else ""
+        return f"任务 #{task_id} 间隔已改为 {interval} 秒{adjusted}。"
 
     async def _login(self, command: IncomingCommand, parts: list[str]) -> str:
         if len(parts) != 2 or not parts[1].isdigit():
             return "发送：登录 <任务ID>"
         return await self.login.start(command, int(parts[1]))
 
-    def _audiences(self, command: IncomingCommand, parts: list[str]) -> str:
-        if len(parts) < 2 or not parts[1].isdigit():
-            return "先发送：观演人 <账号ID>\n查看当前配置和填写格式。"
+    async def _configure(self, command: IncomingCommand, parts: list[str]) -> str:
+        if len(parts) != 2 or not parts[1].isdigit():
+            return "发送：配置 <账号ID>"
+        return await self.configurator.start(command, int(parts[1]))
+
+    def _start_account(self, parts: list[str]) -> str:
+        if len(parts) != 2 or not parts[1].isdigit():
+            return "发送：启动 <账号ID>"
         account_id = int(parts[1])
         account = self.db.get_account(account_id)
         if not account:
             return f"账号 #{account_id} 不存在。"
-        if len(parts) == 2:
-            return audience_prompt(self.db, account_id)
-        if account["status"] == "RUNNING":
-            return "账号正在抢票，请先暂停所属任务。"
-        people = []
-        for raw in " ".join(parts[2:]).replace("，", ",").split(","):
-            pair = [item.strip() for item in raw.split("|", 1)]
-            if len(pair) != 2 or not pair[0]:
-                return "每位观演人格式必须是：姓名|打码证件号"
-            try:
-                people.append((pair[0], validate_masked_id(pair[1])))
-            except ValueError as exc:
-                return str(exc)
-        if len(people) != len(set(people)):
-            return "观演人不能重复。"
-        self.db.replace_audiences(account_id, people)
-        self._refresh_account_status(account_id)
-        return (
-            f"账号 #{account_id} 已配置 {len(people)} 位观演人。\n\n"
-            f"{audience_prompt(self.db, account_id)}\n\n{next_step(self.db, account_id)}"
+        if self.configurator.is_configuring(account_id):
+            return "账号正在配置中；请先在原会话发送“完成”或“取消”。"
+        if account["status"] in {"READY", "RUNNING"} and account["enabled"]:
+            return f"账号 #{account_id} 已经启动。\n{next_step(self.db, account_id)}"
+        try:
+            self.db.activate_account(account_id)
+        except ValueError as exc:
+            return str(exc)
+        self.engine.next_poll[account["task_id"]] = 0
+        task = self.db.get_task(account["task_id"])
+        assert task is not None
+        if not self.engine.system.create_order_enabled:
+            result = "系统当前禁止创建订单，只会继续监控。"
+        elif task["status"] == "paused":
+            result = f"账号已启用，但任务已暂停。发送：恢复 {task['id']}"
+        else:
+            result = "正在等待开售或回流；发现目标库存后自动抢票。"
+        return f"账号 #{account_id} 已启动。\n{result}"
+
+    async def _stop_account(self, parts: list[str]) -> str:
+        if len(parts) != 2 or not parts[1].isdigit():
+            return "发送：停止 <账号ID>"
+        account_id = int(parts[1])
+        account = self.db.get_account(account_id)
+        if not account:
+            return f"账号 #{account_id} 不存在。"
+        self.configurator.cancel_account_session(account_id)
+        await self.engine.cancel_account(account_id)
+        self.db.deactivate_account(account_id)
+        account = self.db.get_account(account_id)
+        assert account is not None
+        suffix = (
+            f"订单保护状态仍为“{status_label(account['status'])}”。"
+            if account["status"] in {"CREATED", "UNKNOWN"}
+            else "配置和登录资料均已保留。"
         )
+        return f"账号 #{account_id} 已停止。\n{suffix}"
 
-    def _accounts(self, parts: list[str]) -> str:
-        if len(parts) > 2 or (len(parts) == 2 and not parts[1].isdigit()):
-            return "发送：账号 [任务ID]"
-        task_id = int(parts[1]) if len(parts) == 2 else None
-        accounts = self.db.list_accounts(task_id)
-        if not accounts:
-            if task_id is not None and self.db.get_task(task_id):
-                return f"任务 #{task_id} 暂无账号。\n下一步：发送“登录 {task_id}”。"
-            return "账号（0）\n请先用“搜索”找到演出并创建抢票任务。"
-        lines = [f"账号（{len(accounts)}）"]
-        for account in accounts:
-            lines.extend(
-                (
-                    f"#{account['id']}｜{mask_phone(account['phone'])}｜任务 #{account['task_id']}｜"
-                    f"{account['status']}｜观演人 {len(self.db.get_audiences(account['id']))}｜"
-                    f"票档 {len(self.db.get_account_plans(account['id']))}",
-                    next_step(self.db, account["id"]),
-                    "",
-                )
-            )
-        if lines[-1] == "":
-            lines.pop()
-        return "\n".join(lines)
-
-    async def _detach(self, command: IncomingCommand, parts: list[str]) -> str:
+    async def _detach(self, parts: list[str]) -> str:
         if len(parts) != 2 or not parts[1].isdigit():
             return "发送：解绑 <账号ID>"
         account_id = int(parts[1])
+        self.configurator.cancel_account_session(account_id)
         await self.engine.cancel_account(account_id)
         await self.login.cancel_account(account_id)
         key = self.db.delete_account(account_id)
         if not key:
             return f"账号 #{account_id} 不存在。"
         remove_account_home(key)
-        return f"账号 #{account_id} 已解绑；登录资料、观演人和订单保护状态均已删除。"
+        return f"账号 #{account_id} 已解绑，全部本地资料和手机号占用均已删除。"
 
-    def _reset(self, command: IncomingCommand, parts: list[str]) -> str:
+    def _reset(self, parts: list[str]) -> str:
         if len(parts) != 2 or not parts[1].isdigit():
             return "发送：重置 <账号ID>"
         account_id = int(parts[1])
@@ -392,30 +411,33 @@ class CommandWorker:
         task = self.db.get_task(account["task_id"])
         plans = self.db.get_account_plans(account_id)
         people = self.db.get_audiences(account_id)
-        if not task or not people or not plans:
-            return next_step(self.db, account_id) or "账号配置不完整。"
-        from .config import build_order_config
-
-        config = build_order_config(task, plans, people, account, self.engine.system)
-        PersistentOrderGuard(config.state_path, config.plan_key).ready()
-        self.db.set_account_status(account_id, "READY")
-        return f"账号 #{account_id} 已恢复 READY。\n{next_step(self.db, account_id)}"
-
-    def _refresh_account_status(self, account_id: int) -> None:
-        account = self.db.get_account(account_id)
-        if account and account["status"] not in {"CREATED", "UNKNOWN", "COMPLETE"}:
-            self.db.set_account_status(
-                account_id, self.db.configuration_status(account_id)
+        if not task or not plans:
+            return f"账号配置不完整。发送：配置 {account_id}"
+        if people:
+            config = build_order_config(
+                task, plans, people, account, self.engine.system
             )
+            PersistentOrderGuard(config.state_path, config.plan_key).ready()
+        self.db.set_account_status(account_id, "STOPPED")
+        self.db.deactivate_account(account_id)
+        next_action = (
+            f"发送：启动 {account_id}"
+            if people
+            else f"本次观演人已全部移出待抢名单。发送：配置 {account_id}"
+        )
+        return (
+            f"账号 #{account_id} 的订单保护已恢复。\n"
+            f"状态：已停止\n确认无待支付订单后：\n{next_action}"
+        )
 
 
 def _mode(task, plans) -> str:
     if task["status"] != "active":
         return "已暂停"
     if any(plan["sale_started"] and plan["can_buy_count"] > 0 for plan in plans):
-        return "有票，等待/正在抢票"
-    if task["session_status"].upper() in {"ONSALE", "ON_SALE", "LACK_OF_TICKET"} or any(
+        return "当前有票"
+    if task["session_status"].upper() in ON_SALE_STATUSES or any(
         plan["sale_started"] for plan in plans
     ):
-        return "回流票等待"
-    return "预抢票等待"
+        return "等待回流"
+    return "等待开售"

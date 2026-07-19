@@ -20,7 +20,7 @@ from .config import (
 )
 from .db import Database
 from .feishu import FeishuGateway, IncomingCommand
-from .messages import audience_prompt, next_step, plan_prompt
+from .messages import next_step
 from .site import PiaoxingqiuPage
 
 
@@ -47,13 +47,12 @@ class LoginSession:
     phase: str = "PHONE"
     account_id: int | None = None
     context_manager: Any = None
-    context: Any = None
     page: Page | None = None
     login: Locator | None = None
     last_message_id: str = ""
     touched_at: float = 0.0
     release_on_failure: bool = False
-    success_status: str = "NEEDS_AUDIENCE"
+    success_status: str = "STOPPED"
 
 
 class FeishuLoginManager:
@@ -136,9 +135,14 @@ class FeishuLoginManager:
                 if session.account_id and not session.release_on_failure:
                     self.db.set_account_status(session.account_id, "NEEDS_LOGIN")
                 if session.last_message_id:
+                    detail = (
+                        "新手机号占用已释放。"
+                        if session.release_on_failure
+                        else "账号资料已保留。"
+                    )
                     await self.feishu.reply_text(
                         session.last_message_id,
-                        "登录流程 5 分钟未操作，已取消并释放手机号。",
+                        f"登录流程 5 分钟未操作，已取消。{detail}",
                     )
 
     async def close(self) -> None:
@@ -157,8 +161,9 @@ class FeishuLoginManager:
             session.success_status = (
                 account["status"]
                 if account["status"] in {"CREATED", "UNKNOWN", "COMPLETE"}
-                else self.db.configuration_status(account["id"])
+                else "STOPPED"
             )
+            self.db.deactivate_account(account["id"])
             await self.cancel_account_worker(account["id"])
         else:
             # 唯一性必须先在 BEGIN IMMEDIATE 中确定；此行之前没有包含手机号的网络请求。
@@ -180,7 +185,6 @@ class FeishuLoginManager:
         manager = persistent_browser(config.browser)
         context = await manager.__aenter__()
         session.context_manager = manager
-        session.context = context
         page = context.pages[0] if context.pages else await context.new_page()
         session.page = page
         site = PiaoxingqiuPage(page, config)
@@ -189,7 +193,7 @@ class FeishuLoginManager:
         login = await _wait_optional_unique(popup)
         if login is None:
             try:
-                await AuthGuard(site).ensure(interactive=False)
+                await AuthGuard(site).ensure()
             except AuthenticationRequired:
                 login = await _wait_unique(popup, "登录弹层")
             else:
@@ -287,21 +291,11 @@ class FeishuLoginManager:
         account_id = session.account_id
         self.db.set_account_status(account_id, session.success_status)
         await self._drop(session, release=False)
-        return (
-            f"账号 #{account_id} 登录成功。"
-            f"{self._configuration_prompt(account_id)}"
-        )
+        return f"账号 #{account_id} 登录成功。{self._configuration_prompt(account_id)}"
 
     def _configuration_prompt(self, account_id: int) -> str:
-        if not self.db.get_account(account_id):
-            return ""
-        lines: list[str] = []
-        if not self.db.get_account_plans(account_id):
-            lines.append(plan_prompt(self.db, account_id))
-        if not self.db.get_audiences(account_id):
-            lines.append(audience_prompt(self.db, account_id))
-        lines.append(next_step(self.db, account_id))
-        return "\n\n" + "\n\n".join(filter(None, lines))
+        step = next_step(self.db, account_id)
+        return f"\n\n{step}" if step else ""
 
     async def _send_captcha(self, session: LoginSession, message_id: str) -> None:
         assert session.page is not None

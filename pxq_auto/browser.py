@@ -39,7 +39,7 @@ async def persistent_browser(config: BrowserConfig):
             or "user data directory is already in use" in message
         ):
             raise RuntimeError(
-                "浏览器资料目录正在使用，请先关闭另一个 pxq-lab 实例"
+                "浏览器资料目录正在使用，请先关闭该账号的其他浏览器实例"
             ) from exc
         raise
     finally:

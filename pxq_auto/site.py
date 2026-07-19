@@ -13,7 +13,7 @@ from .config import AppConfig, AudienceConfig
 from .guard import CREATE_MARKERS
 
 if TYPE_CHECKING:
-    from .inventory import SeatSelection
+    from .inventory import GeneralAdmissionSelection, SeatSelection
 
 
 SUBMIT_LABEL = "去支付"
@@ -56,34 +56,10 @@ class PiaoxingqiuPage:
     def origin(self) -> str:
         return self._origin
 
-    async def resolve_booking_ids(self) -> tuple[str, str]:
-        if self._session_id:
-            return self._show_id, self._session_id
-        endpoint = (
-            f"{self._origin}/cyy_gatewayapi/show/pub/v3/show/"
-            f"{self._show_id}/sessions_static_data"
-        )
-        response = await self.page.context.request.get(endpoint)
-        if not response.ok:
-            raise RuntimeError(f"场次接口返回 HTTP {response.status}")
-        payload = await response.json()
-        if not is_success_payload(payload):
-            raise RuntimeError("场次接口返回异常业务状态")
-        data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        matches = [
-            str(item.get("bizShowSessionId") or "")
-            for item in data.get("sessionVOs", [])
-            if isinstance(item, dict)
-            and str(item.get("sessionName") or "") == self.config.purchase.session
-        ]
-        matches = list(
-            dict.fromkeys(
-                item for item in matches if re.fullmatch(r"[0-9a-fA-F]{24}", item)
-            )
-        )
-        if len(matches) != 1:
-            raise RuntimeError("公开场次接口未唯一匹配配置的完整场次名")
-        self._session_id = matches[0]
+    @property
+    def booking_ids(self) -> tuple[str, str]:
+        if not self._session_id:
+            raise RuntimeError("booking_url 缺少 saleShowSessionId")
         return self._show_id, self._session_id
 
     async def open_purchase(self) -> None:
@@ -110,20 +86,33 @@ class PiaoxingqiuPage:
     async def prepare_order(
         self,
         selection: SeatSelection,
-        audiences: tuple[AudienceConfig, ...] | None = None,
+        audiences: tuple[AudienceConfig, ...],
         *,
         open_map: bool = True,
     ) -> Locator:
         from .seat_map import select_seats
 
-        selected_audiences = (
-            self.config.purchase.audiences if audiences is None else audiences
-        )
-        if len(selected_audiences) != len(selection.candidates):
+        if len(audiences) != len(selection.candidates):
             raise RuntimeError("观演人数与目标座位数不一致")
         confirm = await select_seats(self, selection, open_map=open_map)
         await self._confirm_selected_seat(confirm)
-        await self._select_audiences(selected_audiences)
+        return await self._prepare_submit(audiences)
+
+    async def prepare_general_order(
+        self,
+        selection: GeneralAdmissionSelection,
+        audiences: tuple[AudienceConfig, ...],
+    ) -> Locator:
+        if len(audiences) != selection.quantity:
+            raise RuntimeError("观演人数与购票数量不一致")
+        await self._select_general_ticket(selection)
+        return await self._prepare_submit(audiences)
+
+    async def _prepare_submit(
+        self,
+        audiences: tuple[AudienceConfig, ...],
+    ) -> Locator:
+        await self._select_audiences(audiences)
 
         async def find_submit() -> Locator | None:
             return await self._find_exact(SUBMIT_LABEL)
@@ -135,9 +124,50 @@ class PiaoxingqiuPage:
                 limit=500,
             )
             raise RuntimeError(
-                f"确认选座后未到达提交订单页：{self.page.url}；页面：{body}"
+                f"选择门票后未到达提交订单页：{self.page.url}；页面：{body}"
             )
         return submit
+
+    async def _select_general_ticket(
+        self,
+        selection: GeneralAdmissionSelection,
+    ) -> None:
+        session = await self._poll(
+            lambda: self._find_exact(self.config.purchase.session)
+        )
+        if session is None:
+            raise RuntimeError("booking 页等待配置场次超时")
+        await self._click_action(session)
+        await self.page.evaluate("() => new Promise(requestAnimationFrame)")
+
+        plan = await self._poll(lambda: self._find_exact(selection.plan))
+        if plan is None or await _is_disabled(plan):
+            raise RuntimeError(f"booking 页无法选择目标票档“{selection.plan}”")
+        await self._click_action(plan)
+        for _ in range(selection.quantity - 1):
+            if not await _click_increment(plan):
+                raise RuntimeError(f"票档“{selection.plan}”未找到增加数量按钮")
+            await self.page.evaluate("() => new Promise(requestAnimationFrame)")
+
+        next_step = await self._poll(lambda: self._enabled_exact("下一步"))
+        if next_step is None:
+            raise RuntimeError("booking 页等待可用的“下一步”按钮超时")
+        pages_before = set(self.page.context.pages)
+        url_before = self.page.url
+        body_before = _normalize(await self.page.locator("body").inner_text())
+        await self._click_action(next_step)
+        if not await self._wait_for_transition(
+            pages_before, url_before, body_before=body_before
+        ):
+            raise RuntimeError("点击“下一步”后等待页面变化超时")
+
+    async def _enabled_exact(self, text: str) -> Locator | None:
+        candidate = await self._find_exact(text)
+        return (
+            candidate
+            if candidate is not None and not await _is_disabled(candidate)
+            else None
+        )
 
     async def _select_audiences(self, audiences: tuple[AudienceConfig, ...]) -> None:
         async def find_audience(name: str, masked_id: str) -> Locator | None:
@@ -217,15 +247,7 @@ class PiaoxingqiuPage:
                 raise RuntimeError(f"booking 页无法切换到目标票档“{plan_name}”")
             await self._click_action(target_plan)
 
-        async def find_go_pick() -> Locator | None:
-            candidate = await self._find_exact("去选座")
-            return (
-                candidate
-                if candidate is not None and not await _is_disabled(candidate)
-                else None
-            )
-
-        go_pick = await self._poll(find_go_pick)
+        go_pick = await self._poll(lambda: self._enabled_exact("去选座"))
         if go_pick is None:
             raise RuntimeError("booking 页等待可用的“去选座”按钮超时")
         pages_before = set(self.page.context.pages)
@@ -249,7 +271,7 @@ class PiaoxingqiuPage:
         return None
 
     def _expect_dynamic_request(self, plan_id: str):
-        show_id, session_id = self._booking_ids()
+        show_id, session_id = self.booking_ids
         expected_path = (
             f"/cyy_gatewayapi/show/buyer/v5/show/{show_id}/session/"
             f"{session_id}/seating/dynamic"
@@ -276,7 +298,7 @@ class PiaoxingqiuPage:
         )
 
     def _expect_seat_plans_request(self):
-        show_id, session_id = self._booking_ids()
+        show_id, session_id = self.booking_ids
 
         def matches(request: Request) -> bool:
             parsed = urlsplit(request.url)
@@ -294,11 +316,6 @@ class PiaoxingqiuPage:
             predicate=matches,
             timeout=self.config.browser.timeout_ms,
         )
-
-    def _booking_ids(self) -> tuple[str, str]:
-        if not self._session_id:
-            raise RuntimeError("尚未解析目标场次 ID")
-        return self._show_id, self._session_id
 
     async def _check_finished_request(self, request: Request) -> None:
         response = await request.response()
@@ -393,7 +410,6 @@ class CreateResult:
     order_id: str | None
     http_status: int
     code: str | None
-    sub_code: str | None
     message: str | None
 
 
@@ -439,7 +455,6 @@ class CreateResponseWatcher:
             order_id=order_id,
             http_status=response.status,
             code=code,
-            sub_code=_find_scalar(payload, ("subCode", "sub_code", "bizCode")),
             message=message,
         )
 
@@ -453,6 +468,49 @@ async def _is_disabled(locator: Locator) -> bool:
                     const cls = String(node.className || '').toLowerCase();
                     if (node.disabled || node.getAttribute('aria-disabled') === 'true' ||
                         /(disabled|inactive)/.test(cls)) return true;
+                }
+                return false;
+            }"""
+        )
+    )
+
+
+async def _click_increment(locator: Locator) -> bool:
+    return bool(
+        await locator.evaluate(
+            r"""element => {
+                const visible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = getComputedStyle(node);
+                    return rect.width > 0 && rect.height > 0 &&
+                           style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const isIncrement = node => {
+                    const text = String(node.innerText || node.textContent || '').trim();
+                    const label = String(
+                        node.getAttribute('aria-label') ||
+                        node.getAttribute('title') ||
+                        node.getAttribute('data-action') || ''
+                    ).toLowerCase();
+                    const cls = String(node.className || '').toLowerCase();
+                    return visible(node) && (
+                        text === '+' || text === '＋' ||
+                        /(增加|加一|increment|increase|plus|add)/.test(label) ||
+                        /(^|[-_])(increment|increase|plus|add|jia)([-_]|$)/.test(cls)
+                    );
+                };
+                for (let root = element, depth = 0;
+                     root && depth < 7; root = root.parentElement, depth++) {
+                    const target = [...root.querySelectorAll('*')].find(isIncrement);
+                    if (target) {
+                        target.click();
+                        return true;
+                    }
+                }
+                const targets = [...document.querySelectorAll('*')].filter(isIncrement);
+                if (targets.length === 1) {
+                    targets[0].click();
+                    return true;
                 }
                 return false;
             }"""

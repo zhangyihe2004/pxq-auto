@@ -85,23 +85,87 @@ class SeatGroup:
 @dataclass(frozen=True)
 class SeatSelection:
     candidates: tuple[Candidate, ...]
-    cohesion: int
 
-    @property
-    def cohesion_label(self) -> str:
-        if len(self.candidates) == 1:
-            return "票档内随机"
-        return ("同排连续", "同看台紧凑", "全场紧凑")[self.cohesion]
 
-    @property
-    def plan_summary(self) -> str:
-        counts: dict[tuple[int, str], int] = {}
-        for candidate in self.candidates:
-            key = (candidate.plan_rank, candidate.plan)
-            counts[key] = counts.get(key, 0) + 1
-        return " + ".join(
-            f"{plan} × {count}" for (_, plan), count in sorted(counts.items())
+@dataclass(frozen=True)
+class GeneralAdmissionSelection:
+    plan: str
+    quantity: int
+
+
+@dataclass
+class GeneralAdmissionInventory:
+    site: PiaoxingqiuPage
+    endpoint: str
+    common: dict[str, str]
+    headers: dict[str, str]
+    plan_names: tuple[str, ...]
+    plan_ids: tuple[str, ...]
+
+    @classmethod
+    async def open(
+        cls,
+        site: PiaoxingqiuPage,
+        auth: AuthGuard,
+    ) -> GeneralAdmissionInventory:
+        show_id, session_id, origin = await _show_session_origin(site)
+        if not auth.headers:
+            raise RuntimeError("库存查询缺少已验证的登录状态")
+        return cls(
+            site=site,
+            endpoint=(
+                f"{origin}/cyy_gatewayapi/show/pub/v5/show/{show_id}/session/"
+                f"{session_id}/seat_plans"
+            ),
+            common=request_context(auth.headers),
+            headers=auth.headers,
+            plan_names=site.config.purchase.plans,
+            plan_ids=site.config.purchase.plan_ids,
         )
+
+    async def refresh(self, quantity: int) -> GeneralAdmissionSelection:
+        query = dict(self.common, source="FROM_QUICK_ORDER", src="WEB")
+        response = await self.site.page.context.request.get(
+            _url(self.endpoint, query), headers=self.headers
+        )
+        if not response.ok:
+            raise RuntimeError(f"票档库存接口返回 HTTP {response.status}")
+        data = _response_data(await response.json(), "票档库存接口")
+        if not isinstance(data, dict) or not isinstance(data.get("seatPlans"), list):
+            raise RuntimeError("票档库存接口缺少 seatPlans 数组")
+        live = {
+            str(item.get("seatPlanId") or ""): item
+            for item in data["seatPlans"]
+            if isinstance(item, dict)
+        }
+        options: list[GeneralAdmissionSelection] = []
+        for name, plan_id in zip(self.plan_names, self.plan_ids):
+            item = live.get(plan_id)
+            if not item or not item.get("saleStarted"):
+                continue
+            can_buy = int(item.get("canBuyCount") or 0)
+            limitation = int(item.get("limitation") or 0)
+            available = min(can_buy, limitation) if limitation > 0 else can_buy
+            if available > 0:
+                options.append(
+                    GeneralAdmissionSelection(
+                        plan=name,
+                        quantity=min(quantity, available),
+                    )
+                )
+        if not options:
+            raise InventoryUnavailable("配置票档当前均没有可售票")
+        full = next((option for option in options if option.quantity == quantity), None)
+        return full or max(options, key=lambda option: option.quantity)
+
+    async def wait_available(self, quantity: int) -> GeneralAdmissionSelection:
+        started = asyncio.get_running_loop().time()
+        while True:
+            try:
+                return await self.refresh(quantity)
+            except InventoryUnavailable:
+                elapsed = asyncio.get_running_loop().time() - started
+                await asyncio.sleep(0.25 if elapsed < 10 else 1.0)
 
 
 @dataclass
@@ -292,10 +356,7 @@ class Inventory:
                 key=lambda item: (item.seat.zone_id, item.seat.seat_no),
             )
         )
-        return SeatSelection(
-            candidates=selected_candidates,
-            cohesion=selected.cohesion,
-        )
+        return SeatSelection(candidates=selected_candidates)
 
     async def wait_available(self, quantity: int) -> SeatSelection:
         started = asyncio.get_running_loop().time()
@@ -308,7 +369,7 @@ class Inventory:
 
 
 async def _show_session_origin(site: PiaoxingqiuPage) -> tuple[str, str, str]:
-    show_id, session_id = await site.resolve_booking_ids()
+    show_id, session_id = site.booking_ids
     return show_id, session_id, site.origin
 
 

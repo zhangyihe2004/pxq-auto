@@ -4,18 +4,17 @@ import asyncio
 import logging
 import time
 
+from .auth import AuthGuard
 from .browser import persistent_browser
 from .config import SystemConfig, build_order_config
 from .db import Database
 from .feishu import FeishuGateway
+from .presale import PREWARM_SECONDS
 from .runner import RunResult, check_login, run_account
-from .service import TaskService
+from .service import ON_SALE_STATUSES, TERMINAL_STATUSES, TaskService
 
 
 log = logging.getLogger("pxq.auto")
-PREWARM_SECONDS = 60
-ON_SALE = {"ONSALE", "ON_SALE", "LACK_OF_TICKET"}
-TERMINAL = {"SALE_END", "ENDED", "CANCELLED", "CANCELED", "OFF_SHELF"}
 
 
 class AutoEngine:
@@ -73,7 +72,7 @@ class AutoEngine:
             if task["sale_time_ms"] is not None
             else None
         )
-        if status.upper() in TERMINAL:
+        if status.upper() in TERMINAL_STATUSES:
             self.db.set_task_status(task_id, "paused")
             await self.feishu.send_card(
                 "抢票任务已暂停",
@@ -83,7 +82,7 @@ class AutoEngine:
             await self.cancel_task(task_id)
             return
 
-        started = status.upper() in ON_SALE or any(
+        started = status.upper() in ON_SALE_STATUSES or any(
             plan["sale_started"] for plan in plans
         )
         presale = not started and remaining is not None and remaining <= PREWARM_SECONDS
@@ -94,7 +93,11 @@ class AutoEngine:
                     plan["sale_started"] and plan["can_buy_count"] > 0
                     for plan in account_plans
                 )
-                if account["status"] == "READY" and (presale or available):
+                if (
+                    account["enabled"]
+                    and account["status"] == "READY"
+                    and (presale or available)
+                ):
                     self._start_account(account["id"], presale=presale)
 
         await self._schedule_login_checks(task, remaining)
@@ -131,7 +134,7 @@ class AutoEngine:
     async def _run_account(self, account_id: int, presale: bool) -> None:
         async with self.semaphore:
             account = self.db.get_account(account_id)
-            if not account or account["status"] != "READY":
+            if not account or not account["enabled"] or account["status"] != "READY":
                 return
             task = self.db.get_task(account["task_id"])
             if not task or task["status"] != "active":
@@ -139,31 +142,41 @@ class AutoEngine:
             plans = self.db.get_account_plans(account_id)
             people = self.db.get_audiences(account_id)
             config = build_order_config(task, plans, people, account, self.system)
-            self.db.set_account_status(account_id, "RUNNING")
+            if not self.db.claim_account(account_id):
+                return
             try:
                 async with persistent_browser(config.browser) as context:
                     result = await run_account(config, context, presale=presale)
             except asyncio.CancelledError:
-                if self.db.get_account(account_id):
-                    self.db.set_account_status(account_id, "READY")
+                current = self.db.get_account(account_id)
+                if current:
+                    self.db.set_account_status(
+                        account_id, "READY" if current["enabled"] else "STOPPED"
+                    )
                 raise
             except Exception as exc:
                 log.exception("账号 #%s 抢票执行失败", account_id)
-                if self.db.get_account(account_id):
-                    self.db.set_account_status(account_id, "READY", error=str(exc))
+                current = self.db.get_account(account_id)
+                if current:
+                    self.db.set_account_status(
+                        account_id,
+                        "READY" if current["enabled"] else "STOPPED",
+                        error=str(exc),
+                    )
                 await self._notify_result(
                     account_id, task, RunResult("FAILED", str(exc))
                 )
                 return
             self._apply_removed_audiences(account_id, result.removed_audiences)
-            if not self.db.get_account(account_id):
+            current = self.db.get_account(account_id)
+            if current is None:
                 return
             next_status = {
                 "CREATED": "CREATED",
                 "UNKNOWN": "UNKNOWN",
                 "NEEDS_LOGIN": "NEEDS_LOGIN",
                 "COMPLETE": "COMPLETE",
-            }.get(result.status, "READY")
+            }.get(result.status, "READY" if current["enabled"] else "STOPPED")
             self.db.set_account_status(
                 account_id,
                 next_status,
@@ -176,16 +189,15 @@ class AutoEngine:
                 await self._notify_result(account_id, task, result)
 
     async def _schedule_login_checks(self, task, remaining: float | None) -> None:
-        interval = 900 if remaining is None or remaining > 3600 else 300
-        if remaining is not None and remaining <= 600:
-            interval = 60
-        if remaining is not None and remaining <= 120:
-            interval = 15
+        interval = AuthGuard.interval(
+            remaining if remaining is not None else float("inf")
+        )
         now = time.monotonic()
         for account in self.db.list_accounts(task["id"]):
             account_id = int(account["id"])
             if (
-                account["status"] != "READY"
+                not account["enabled"]
+                or account["status"] != "READY"
                 or account_id in self.jobs
                 or account_id in self.checks
                 or now < self.next_auth.get(account_id, 0)
@@ -204,7 +216,12 @@ class AutoEngine:
     async def _check_account_login(self, account_id: int, task) -> None:
         async with self.semaphore:
             account = self.db.get_account(account_id)
-            if not account or account["status"] != "READY" or account_id in self.jobs:
+            if (
+                not account
+                or not account["enabled"]
+                or account["status"] != "READY"
+                or account_id in self.jobs
+            ):
                 return
             plans = self.db.get_account_plans(account_id)
             people = self.db.get_audiences(account_id)
@@ -254,6 +271,7 @@ class AutoEngine:
         await self.feishu.send_card(title, body, color)
 
     async def cancel_account(self, account_id: int) -> None:
+        self.next_auth.pop(account_id, None)
         activities = [
             activity
             for activity in (self.jobs.get(account_id), self.checks.get(account_id))
@@ -265,8 +283,12 @@ class AutoEngine:
             await asyncio.gather(*activities, return_exceptions=True)
 
     async def cancel_task(self, task_id: int) -> None:
-        for account in self.db.list_accounts(task_id):
-            await self.cancel_account(account["id"])
+        await asyncio.gather(
+            *(
+                self.cancel_account(account["id"])
+                for account in self.db.list_accounts(task_id)
+            )
+        )
 
     async def close(self) -> None:
         activities = [*self.jobs.values(), *self.checks.values()]
