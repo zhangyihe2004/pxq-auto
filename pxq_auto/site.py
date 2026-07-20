@@ -410,6 +410,7 @@ class CreateResult:
     order_id: str | None
     http_status: int
     code: str | None
+    sub_code: str | None
     message: str | None
 
 
@@ -455,6 +456,7 @@ class CreateResponseWatcher:
             order_id=order_id,
             http_status=response.status,
             code=code,
+            sub_code=_find_scalar(payload, ("subCode", "sub_code", "bizCode")),
             message=message,
         )
 

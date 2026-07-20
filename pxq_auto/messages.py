@@ -28,17 +28,15 @@ def next_step(db: Database, account_id: int) -> str:
     if status in {"RESERVED", "NEEDS_LOGIN"}:
         return f"下一步：登录 {account['task_id']}"
     if status == "CREATED":
-        return "已创建待支付订单，程序不会支付。"
+        return f"下一步：处理待支付订单；如已取消并需继续，发送：重置 {account_id}"
     if status == "UNKNOWN":
-        return f"请先人工检查待支付订单；确认无订单后发送：重置 {account_id}"
+        return f"下一步：检查待支付订单；确认无订单后发送：重置 {account_id}"
     if not db.get_account_plans(account_id) or not db.get_audiences(account_id):
         return f"下一步：配置 {account_id}"
     if status == "STOPPED":
         return f"下一步：启动 {account_id}"
     if status == "READY" and task and task["status"] == "paused":
         return f"账号已启用；任务暂停中，发送：恢复 {task['id']}"
-    return {
-        "READY": "账号已启动，正在等待开售或回流。",
-        "RUNNING": "账号正在执行抢票。",
-        "COMPLETE": f"如需更换观演人，发送：配置 {account_id}",
-    }.get(status, "")
+    if status == "COMPLETE":
+        return f"下一步：配置 {account_id}（更换观演人）"
+    return ""

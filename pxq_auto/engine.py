@@ -2,19 +2,42 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
+from dataclasses import dataclass
 
 from .auth import AuthGuard
 from .browser import persistent_browser
 from .config import SystemConfig, build_order_config
 from .db import Database
 from .feishu import FeishuGateway
-from .presale import PREWARM_SECONDS
 from .runner import RunResult, check_login, run_account
-from .service import ON_SALE_STATUSES, TERMINAL_STATUSES, TaskService
+from .service import (
+    PREWARM_SECONDS,
+    TERMINAL_STATUSES,
+    SessionUnavailable,
+    TaskService,
+    sale_phase,
+)
 
 
 log = logging.getLogger("pxq.auto")
+ERROR_ALERT_COOLDOWN = 3600.0
+MAX_BACKOFF_FACTOR = 16
+MAX_CONCURRENT_POLLS = 3
+PLAN_MISSING_THRESHOLD = 3
+SESSION_GONE_THRESHOLD = 3
+
+
+@dataclass(frozen=True)
+class PendingNotice:
+    key: str
+    title: str
+    body: str
+    template: str
+    available_after: frozenset[str] | None = None
+    pause_task: bool = False
+    error_alert: bool = False
 
 
 class AutoEngine:
@@ -34,34 +57,110 @@ class AutoEngine:
         self.checks: dict[int, asyncio.Task] = {}
         self.next_poll: dict[int, float] = {}
         self.next_auth: dict[int, float] = {}
+        self.failures: dict[int, int] = {}
+        self.session_gone: dict[int, int] = {}
+        self.plan_missing: dict[int, dict[str, int]] = {}
+        self.last_error_alert: dict[int, float] = {}
+        self.pending_notices: dict[int, dict[str, PendingNotice]] = {}
+        self.available_plans: dict[int, set[str]] = {}
 
     async def run_forever(self) -> None:
         log.info("自动抢票引擎启动")
         while True:
-            await self.tick()
-            await asyncio.sleep(1)
-
-    async def tick(self) -> None:
-        now = time.monotonic()
-        tasks = self.db.list_tasks()
-        active_ids = {task["id"] for task in tasks if task["status"] == "active"}
-        for task_id in set(self.next_poll) - active_ids:
-            self.next_poll.pop(task_id, None)
-        for task in tasks:
-            if task["status"] != "active" or now < self.next_poll.get(task["id"], 0):
-                continue
             try:
-                await self._poll(task)
+                await self.tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("抢票任务 #%s 轮询失败", task["id"])
-                self.next_poll[task["id"]] = now + task["interval_sec"]
+                log.exception("抢票调度循环异常，将在下一轮重试")
+            await asyncio.sleep(1)
 
-    async def _poll(self, task) -> None:
+    async def tick(self) -> None:
+        tasks = self.db.list_tasks()
+        active_ids = {task["id"] for task in tasks if task["status"] == "active"}
+        self._prune_runtime_state(active_ids)
+        now = time.monotonic()
+        due = [
+            task
+            for task in tasks
+            if task["status"] == "active"
+            and now >= self.next_poll.get(task["id"], 0)
+        ]
+        if not due:
+            return
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_POLLS)
+        session_tasks: dict[str, asyncio.Task[list[dict]]] = {}
+
+        async def poll_due(task) -> None:
+            async with semaphore:
+                show_id = str(task["show_id"])
+                sessions_task = session_tasks.get(show_id)
+                if sessions_task is None:
+                    sessions_task = asyncio.create_task(
+                        self.service.client.quick_order_sessions(show_id)
+                    )
+                    session_tasks[show_id] = sessions_task
+                await self._poll_safely(task, sessions_task)
+
+        await asyncio.gather(*(poll_due(task) for task in due))
+
+    async def _poll_safely(
+        self,
+        task,
+        sessions_task: asyncio.Task[list[dict]],
+    ) -> None:
         task_id = int(task["id"])
-        status, snapshot = await self.service.refresh_task(task)
-        if not self.db.update_task_snapshot(task_id, status, snapshot):
+        try:
+            if not await self._retry_notices(task_id, include_pause=False):
+                return
+            await self._poll(task, sessions_task)
+            self.session_gone.pop(task_id, None)
+            if self.failures.get(task_id):
+                log.info("抢票任务 #%s 轮询恢复正常", task_id)
+            self.failures[task_id] = 0
+        except SessionUnavailable as exc:
+            self.failures[task_id] = 0
+            await self._handle_session_gone(task, exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures = self.failures.get(task_id, 0) + 1
+            self.failures[task_id] = failures
+            log.warning(
+                "抢票任务 #%s 轮询失败（连续 %s 次）：%s",
+                task_id,
+                failures,
+                exc,
+            )
+            if failures >= 5:
+                await self._alert_poll_error(task, failures, exc)
+        finally:
+            self._schedule_next(task_id)
+
+    async def _poll(
+        self,
+        task,
+        sessions_task: asyncio.Task[list[dict]],
+    ) -> None:
+        task_id = int(task["id"])
+        if task_id not in self.available_plans:
+            previous = self.db.get_task_plans(task_id)
+            self.available_plans[task_id] = self._available_plan_ids(
+                task_id,
+                previous,
+                sale_phase(task, previous),
+            )
+        status, sale_time_ms, snapshot = await self.service.refresh_task(
+            task, sessions_task
+        )
+        self._drop_notice(task_id, "session-gone")
+        if status.upper() not in TERMINAL_STATUSES:
+            self._drop_notice(task_id, "terminal")
+        if not await self._retry_notices(task_id):
+            return
+        snapshot = self._stabilize_snapshot(task_id, snapshot)
+        if not self.db.update_task_snapshot(task_id, status, sale_time_ms, snapshot):
             return
         task = self.db.get_task(task_id)
         assert task is not None
@@ -73,19 +172,21 @@ class AutoEngine:
             else None
         )
         if status.upper() in TERMINAL_STATUSES:
-            self.db.set_task_status(task_id, "paused")
-            await self.feishu.send_card(
-                "抢票任务已暂停",
-                f"任务 #{task_id}\n**{task['show_name']}**\n场次状态：{status}",
-                "orange",
+            await self._send_notice(
+                task_id,
+                PendingNotice(
+                    "terminal",
+                    "抢票任务已暂停",
+                    f"任务 #{task_id}\n**{task['show_name']}**\n场次状态：{status}",
+                    "orange",
+                    pause_task=True,
+                ),
             )
-            await self.cancel_task(task_id)
             return
 
-        started = status.upper() in ON_SALE_STATUSES or any(
-            plan["sale_started"] for plan in plans
-        )
-        presale = not started and remaining is not None and remaining <= PREWARM_SECONDS
+        phase = sale_phase(task, plans, now_ms)
+        await self._update_stock_notice(task, plans, phase)
+        presale = phase == "PREWARM"
         if self.system.create_order_enabled:
             for account in self.db.list_accounts(task_id):
                 account_plans = self.db.get_account_plans(account["id"])
@@ -96,15 +197,223 @@ class AutoEngine:
                 if (
                     account["enabled"]
                     and account["status"] == "READY"
-                    and (presale or available)
+                    and (presale or (phase == "AVAILABLE" and available))
                 ):
                     self._start_account(account["id"], presale=presale)
 
         await self._schedule_login_checks(task, remaining)
-        delay = task["interval_sec"]
-        if not started and remaining is not None and remaining > PREWARM_SECONDS:
-            delay = min(delay, max(1.0, remaining - PREWARM_SECONDS))
+
+    def _stabilize_snapshot(
+        self,
+        task_id: int,
+        snapshot: list[tuple[str, int, bool]],
+    ) -> list[tuple[str, int, bool]]:
+        current_ids = {plan_id for plan_id, _, _ in snapshot}
+        missing = self.plan_missing.setdefault(task_id, {})
+        for plan_id in current_ids:
+            missing.pop(plan_id, None)
+        for previous in self.db.get_task_plans(task_id):
+            plan_id = str(previous["seat_plan_id"])
+            if plan_id in current_ids:
+                continue
+            rounds = min(
+                missing.get(plan_id, 0) + 1,
+                PLAN_MISSING_THRESHOLD,
+            )
+            missing[plan_id] = rounds
+            snapshot.append(
+                (
+                    plan_id,
+                    int(previous["can_buy_count"])
+                    if rounds < PLAN_MISSING_THRESHOLD
+                    else 0,
+                    bool(previous["sale_started"]),
+                )
+            )
+        return snapshot
+
+    async def _handle_session_gone(self, task, exc: Exception) -> None:
+        task_id = int(task["id"])
+        if not await self._retry_notices(task_id):
+            return
+        rounds = self.session_gone.get(task_id, 0) + 1
+        self.session_gone[task_id] = rounds
+        log.info("抢票任务 #%s 场次连续缺失 %s 轮", task_id, rounds)
+        if rounds < SESSION_GONE_THRESHOLD:
+            return
+        await self._send_notice(
+            task_id,
+            PendingNotice(
+                "session-gone",
+                "抢票任务已暂停",
+                (
+                    f"任务 #{task_id}\n**{task['show_name']}**\n"
+                    f"场次已连续 {rounds} 次从接口消失：{exc}"
+                ),
+                "orange",
+                pause_task=True,
+            ),
+        )
+
+    async def _update_stock_notice(self, task, plans, phase: str) -> None:
+        task_id = int(task["id"])
+        current = self._available_plan_ids(task_id, plans, phase)
+        added = current - self.available_plans[task_id]
+        if not added:
+            self.available_plans[task_id] = current
+            return
+        available = [plan for plan in plans if str(plan["seat_plan_id"]) in added]
+        await self._send_notice(
+            task_id,
+            PendingNotice(
+                "stock",
+                "余票提醒",
+                "\n".join(
+                    (
+                        f"任务 #{task_id}\n**{task['show_name']}**",
+                        f"场次：{task['session_name']}",
+                        *(
+                            f"· {plan['plan_name']}：{plan['can_buy_count']} 张"
+                            for plan in available
+                        ),
+                    )
+                ),
+                "red",
+                available_after=frozenset(current),
+            ),
+        )
+
+    def _available_plan_ids(self, task_id: int, plans, phase: str) -> set[str]:
+        watched = {
+            str(plan["seat_plan_id"])
+            for account in self.db.list_accounts(task_id)
+            if account["enabled"]
+            for plan in self.db.get_account_plans(account["id"])
+        }
+        return {
+            str(plan["seat_plan_id"])
+            for plan in plans
+            if phase == "AVAILABLE"
+            and str(plan["seat_plan_id"]) in watched
+            and plan["sale_started"]
+            and plan["can_buy_count"] > 0
+        }
+
+    async def _alert_poll_error(
+        self,
+        task,
+        failures: int,
+        exc: Exception,
+    ) -> None:
+        task_id = int(task["id"])
+        last = self.last_error_alert.get(task_id)
+        if last is not None and time.monotonic() - last < ERROR_ALERT_COOLDOWN:
+            return
+        await self._send_notice(
+            task_id,
+            PendingNotice(
+                "poll-error",
+                "抢票监控异常",
+                (
+                    f"任务 #{task_id}\n**{task['show_name']}**\n"
+                    f"连续 {failures} 次抓取失败，已自动放慢频率。\n最近错误：{exc}"
+                ),
+                "orange",
+                error_alert=True,
+            ),
+        )
+
+    async def _send_notice(self, task_id: int, notice: PendingNotice) -> bool:
+        pending = self.pending_notices.setdefault(task_id, {})
+        if notice.key in pending:
+            return False
+        pending[notice.key] = notice
+        if not await self.feishu.send_card(
+            notice.title,
+            notice.body,
+            notice.template,
+        ):
+            return False
+        pending.pop(notice.key, None)
+        await self._complete_notice(task_id, notice)
+        return True
+
+    async def _retry_notices(
+        self,
+        task_id: int,
+        *,
+        include_pause: bool = True,
+    ) -> bool:
+        task = self.db.get_task(task_id)
+        if not task or task["status"] != "active":
+            self._clear_runtime_state(task_id)
+            return False
+        for notice in list(self.pending_notices.get(task_id, {}).values()):
+            if notice.pause_task and not include_pause:
+                continue
+            if not await self.feishu.send_card(
+                notice.title,
+                notice.body,
+                notice.template,
+            ):
+                return True
+            self.pending_notices[task_id].pop(notice.key, None)
+            await self._complete_notice(task_id, notice)
+            if notice.pause_task:
+                return False
+        return True
+
+    async def _complete_notice(self, task_id: int, notice: PendingNotice) -> None:
+        if notice.available_after is not None:
+            self.available_plans[task_id] = set(notice.available_after)
+        if notice.error_alert:
+            self.last_error_alert[task_id] = time.monotonic()
+        if notice.pause_task and self.db.set_task_status(task_id, "paused"):
+            await self.cancel_task(task_id)
+            self._clear_runtime_state(task_id)
+
+    def _drop_notice(self, task_id: int, key: str) -> None:
+        notices = self.pending_notices.get(task_id)
+        if notices:
+            notices.pop(key, None)
+
+    def _schedule_next(self, task_id: int) -> None:
+        task = self.db.get_task(task_id)
+        if not task or task["status"] != "active":
+            self._clear_runtime_state(task_id)
+            return
+        delay = task["interval_sec"] * random.uniform(0.9, 1.2)
+        delay *= min(2 ** self.failures.get(task_id, 0), MAX_BACKOFF_FACTOR)
+        if task["sale_time_ms"] is not None:
+            remaining = (task["sale_time_ms"] - int(time.time() * 1000)) / 1000
+            if remaining > PREWARM_SECONDS:
+                delay = min(delay, max(1.0, remaining - PREWARM_SECONDS))
         self.next_poll[task_id] = time.monotonic() + delay
+
+    def _prune_runtime_state(self, active_ids: set[int]) -> None:
+        for mapping in (
+            self.next_poll,
+            self.failures,
+            self.session_gone,
+            self.last_error_alert,
+            self.plan_missing,
+            self.pending_notices,
+            self.available_plans,
+        ):
+            for task_id in set(mapping) - active_ids:
+                mapping.pop(task_id, None)
+
+    def _clear_runtime_state(self, task_id: int) -> None:
+        for mapping in (
+            self.next_poll,
+            self.failures,
+            self.session_gone,
+            self.last_error_alert,
+            self.plan_missing,
+            self.pending_notices,
+            self.available_plans,
+        ):
+            mapping.pop(task_id, None)
 
     def _start_account(self, account_id: int, *, presale: bool) -> None:
         if account_id in self.jobs:
@@ -238,10 +547,14 @@ class AutoEngine:
                 self.db.set_account_status(
                     account_id, "NEEDS_LOGIN", error="登录已失效"
                 )
-                await self.feishu.send_card(
-                    "账号登录已失效",
-                    f"任务 #{task['id']}｜账号 #{account_id}\n发送：登录 {task['id']}",
-                    "orange",
+                await self._send_notice(
+                    int(task["id"]),
+                    PendingNotice(
+                        f"login:{account_id}",
+                        "账号登录已失效",
+                        f"任务 #{task['id']}｜账号 #{account_id}\n发送：登录 {task['id']}",
+                        "orange",
+                    ),
                 )
 
     def _apply_removed_audiences(
@@ -264,11 +577,31 @@ class AutoEngine:
             "COMPLETE": "观演人均已购",
         }.get(result.status, "抢票执行异常")
         color = "green" if result.status in {"CREATED", "COMPLETE"} else "orange"
+        action = {
+            "CREATED": (
+                "下一步：在票星球处理待支付订单；"
+                f"如已取消并需继续，发送：重置 {account_id}"
+            ),
+            "UNKNOWN": (
+                "下一步：检查票星球待支付订单；"
+                f"确认无订单后发送：重置 {account_id}"
+            ),
+            "NEEDS_LOGIN": f"下一步：登录 {task['id']}",
+            "COMPLETE": f"下一步：配置 {account_id}",
+        }.get(result.status, "状态：账号保持启动，将自动继续等待。")
         body = (
             f"任务 #{task['id']}｜账号 #{account_id}\n"
-            f"**{task['show_name']}**\n{result.message}\n操作：未支付"
+            f"**{task['show_name']}**\n{result.message}\n{action}\n操作：未支付"
         )
-        await self.feishu.send_card(title, body, color)
+        await self._send_notice(
+            int(task["id"]),
+            PendingNotice(
+                f"result:{account_id}:{result.status}",
+                title,
+                body,
+                color,
+            ),
+        )
 
     async def cancel_account(self, account_id: int) -> None:
         self.next_auth.pop(account_id, None)

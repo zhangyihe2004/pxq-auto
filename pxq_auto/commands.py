@@ -12,10 +12,12 @@ from .feishu import FeishuGateway, IncomingCommand
 from .guard import PersistentOrderGuard
 from .login import FeishuLoginManager
 from .messages import next_step, status_label
-from .service import MIN_INTERVAL, ON_SALE_STATUSES, TaskService, extract_show_id
+from .service import MIN_INTERVAL, TaskService, extract_show_id, sale_phase
 
 
 SEARCH_TTL = 900
+REPLY_RETRY_SECONDS = 10
+MAX_PENDING_REPLIES = 100
 HELP = """票星球自动抢票
 
 【创建】
@@ -32,13 +34,15 @@ HELP = """票星球自动抢票
 启动 <账号ID>
 停止 <账号ID>
 解绑 <账号ID>
-重置 <账号ID>  （确认无待支付订单后使用）
+重置 <账号ID>（确认无待支付订单后使用）
 
 【任务】
 间隔 <任务ID> [秒]
 暂停 <任务ID> / 恢复 <任务ID> / 删除 <任务ID>
 
 配置必须发送“完成”后才保存，保存后还需明确“启动”；程序只创建待支付订单，永不支付。
+登录和配置的任意步骤均可发送“取消”，退出且不保存当前步骤。
+群聊中非管理员仅可使用搜索、列表和详情。
 群聊使用时每条消息都要先 @机器人。"""
 
 
@@ -58,26 +62,61 @@ class CommandWorker:
         self.engine = engine
         self.login = login
         self.feishu = feishu
-        self.configurator = AccountConfigurator(db, engine.cancel_account)
+        self.pending_replies: dict[str, str] = {}
+        self.configurator = AccountConfigurator(
+            db,
+            engine.cancel_account,
+            self._reply,
+        )
         self.searches: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 
     async def run_forever(self) -> None:
+        maintenance = asyncio.create_task(self._maintain())
+        try:
+            while True:
+                command = await self.queue.get()
+                try:
+                    response = await self.execute(command)
+                except Exception as exc:
+                    response = f"执行失败：{exc}"
+                try:
+                    await self._reply(command.message_id, response)
+                finally:
+                    self.queue.task_done()
+        finally:
+            maintenance.cancel()
+            await asyncio.gather(maintenance, return_exceptions=True)
+
+    async def _reply(self, message_id: str, text: str) -> None:
+        if self.pending_replies:
+            self._queue_reply(message_id, text)
+            return
+        if await self.feishu.reply_text(message_id, text):
+            return
+        self._queue_reply(message_id, text)
+
+    def _queue_reply(self, message_id: str, text: str) -> None:
+        if len(self.pending_replies) >= MAX_PENDING_REPLIES:
+            self.pending_replies.pop(next(iter(self.pending_replies)))
+        self.pending_replies[message_id] = text
+
+    async def _maintain(self) -> None:
         while True:
-            command = await self.queue.get()
-            try:
-                response = await self.execute(command)
-            except Exception as exc:
-                response = f"执行失败：{exc}"
-            try:
-                await self.feishu.reply_text(command.message_id, response)
-            finally:
-                self.queue.task_done()
+            await asyncio.sleep(REPLY_RETRY_SECONDS)
+            await self.configurator.expire()
+            await self._retry_replies()
+
+    async def _retry_replies(self) -> None:
+        for message_id, text in list(self.pending_replies.items()):
+            if not await self.feishu.reply_text(message_id, text):
+                break
+            self.pending_replies.pop(message_id, None)
 
     async def execute(self, command: IncomingCommand) -> str:
         response = await self.login.consume(command)
         if response is not None:
             return response
-        response = self.configurator.consume(command)
+        response = await self.configurator.consume(command)
         if response is not None:
             return response
         try:
@@ -113,7 +152,7 @@ class CommandWorker:
             return await self._detach(parts)
         if name == "重置":
             return self._reset(parts)
-        return f"无法识别指令：{name}\n\n{HELP}"
+        return f"无法识别指令：{name}\n发送：帮助"
 
     @staticmethod
     def _key(command: IncomingCommand) -> tuple[str, str]:
@@ -176,7 +215,12 @@ class CommandWorker:
                 f"{number}. {session.get('sessionName', '')}"
                 for number, session in enumerate(sessions, 1)
             )
-            lines.extend(("", f"发送：抢票 {parts[1]} 场次 <序号>"))
+            lines.extend(
+                (
+                    "",
+                    f"发送：抢票 {parts[1]} 场次 <序号> 间隔 {options['间隔']}",
+                )
+            )
             return "\n".join(lines)
         try:
             session_number = int(options["场次"] or "1")
@@ -241,19 +285,22 @@ class CommandWorker:
             return f"任务 #{task_id} 不存在。"
         plans = self.db.get_task_plans(task_id)
         accounts = self.db.list_accounts(task_id)
+        phase = sale_phase(task, plans)
         lines = [
             f"任务 #{task_id}",
             f"演出：{task['show_name']}",
             f"场次：{task['session_name']}",
             f"方式：{'选座' if task['support_seat_picking'] else '不选座'}",
-            f"任务状态：{'运行中' if task['status'] == 'active' else '已暂停'}｜{_mode(task, plans)}",
+            f"状态：{_mode(task, plans)}",
             f"间隔：{task['interval_sec']} 秒",
             "",
             f"票档目录（{len(plans)}）：",
         ]
         for number, plan in enumerate(plans, 1):
             stock = (
-                f"有票 {plan['can_buy_count']} 张"
+                "未开售"
+                if phase in {"PRESALE", "PREWARM", "WAITING"}
+                else f"有票 {plan['can_buy_count']} 张"
                 if plan["sale_started"] and plan["can_buy_count"] > 0
                 else "可售但无票"
                 if plan["sale_started"]
@@ -274,14 +321,15 @@ class CommandWorker:
                         else "未配置"
                     ),
                     f"观演人（{len(people)}）：",
-                    *(
-                        f"  {index}. {person['name']}｜{person['masked_id']}"
-                        for index, person in enumerate(people, 1)
-                    ),
-                    next_step(self.db, account["id"]),
-                    "",
                 )
             )
+            lines.extend(
+                f"  {index}. {person['name']}｜{person['masked_id']}"
+                for index, person in enumerate(people, 1)
+            )
+            if step := next_step(self.db, account["id"]):
+                lines.append(step)
+            lines.append("")
         if not accounts:
             lines.append(f"下一步：登录 {task_id}")
         elif lines[-1] == "":
@@ -353,11 +401,17 @@ class CommandWorker:
         if self.configurator.is_configuring(account_id):
             return "账号正在配置中；请先在原会话发送“完成”或“取消”。"
         if account["status"] in {"READY", "RUNNING"} and account["enabled"]:
-            return f"账号 #{account_id} 已经启动。\n{next_step(self.db, account_id)}"
+            step = next_step(self.db, account_id)
+            return (
+                f"账号 #{account_id} 已经启动。\n{step}"
+                if step
+                else f"账号 #{account_id} 已经启动。"
+            )
         try:
             self.db.activate_account(account_id)
         except ValueError as exc:
-            return str(exc)
+            step = next_step(self.db, account_id)
+            return f"{exc}。\n{step}" if step else f"{exc}。"
         self.engine.next_poll[account["task_id"]] = 0
         task = self.db.get_task(account["task_id"])
         assert task is not None
@@ -382,7 +436,7 @@ class CommandWorker:
         account = self.db.get_account(account_id)
         assert account is not None
         suffix = (
-            f"订单保护状态仍为“{status_label(account['status'])}”。"
+            next_step(self.db, account_id)
             if account["status"] in {"CREATED", "UNKNOWN"}
             else "配置和登录资料均已保留。"
         )
@@ -421,23 +475,23 @@ class CommandWorker:
         self.db.set_account_status(account_id, "STOPPED")
         self.db.deactivate_account(account_id)
         next_action = (
-            f"发送：启动 {account_id}"
+            f"启动 {account_id}"
             if people
-            else f"本次观演人已全部移出待抢名单。发送：配置 {account_id}"
+            else f"配置 {account_id}（观演人已全部移出待抢名单）"
         )
         return (
-            f"账号 #{account_id} 的订单保护已恢复。\n"
-            f"状态：已停止\n确认无待支付订单后：\n{next_action}"
+            f"账号 #{account_id} 的订单保护已重置。\n"
+            f"状态：已停止\n下一步：{next_action}"
         )
 
 
 def _mode(task, plans) -> str:
     if task["status"] != "active":
         return "已暂停"
-    if any(plan["sale_started"] and plan["can_buy_count"] > 0 for plan in plans):
-        return "当前有票"
-    if task["session_status"].upper() in ON_SALE_STATUSES or any(
-        plan["sale_started"] for plan in plans
-    ):
-        return "等待回流"
-    return "等待开售"
+    return {
+        "PRESALE": "等待开售",
+        "PREWARM": "预抢票准备",
+        "AVAILABLE": "当前有票",
+        "ONSALE": "等待回流",
+        "WAITING": "等待开售",
+    }[sale_phase(task, plans)]
