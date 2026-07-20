@@ -210,11 +210,15 @@ def validate_phone(value: str) -> str:
     return value
 
 
-def validate_masked_id(value: str) -> str:
-    value = value.strip()
-    if not re.fullmatch(r"\d{3}\*+[0-9Xx]{4}", value):
-        raise ValueError("证件号格式应与票星球打码显示一致，如 110***********1234")
-    return value
+def mask_id(value: str) -> str:
+    parts = value.split()
+    if (
+        len(parts) != 2
+        or not re.fullmatch(r"\d{3}", parts[0])
+        or not re.fullmatch(r"[0-9Xx]{4}", parts[1])
+    ):
+        raise ValueError("身份证号只需输入前 3 位和后 4 位，如 210 2534")
+    return f"{parts[0]}{'*' * 11}{parts[1].upper()}"
 
 
 def mask_phone(phone: str) -> str:

@@ -10,11 +10,10 @@ from urllib.parse import urlencode
 from playwright.async_api import APIResponse
 
 from .auth import AuthGuard, request_context
-from .service import ON_SALE_STATUSES, TERMINAL_STATUSES
+from .service import ON_SALE_STATUSES, PREWARM_SECONDS, TERMINAL_STATUSES
 from .site import PiaoxingqiuPage, is_success_payload
 
 
-PREWARM_SECONDS = 60
 INTENSIVE_SECONDS = 3
 STATUS_POLL_SECONDS = 0.25
 WARM_POLL_SECONDS = 1.0
@@ -65,6 +64,7 @@ class SaleGate:
             raise RuntimeError("开售状态接口未找到 booking_url 对应的目标场次")
         session_sale_time = _first_millis(
             session_items,
+            "sessionSaleTime",
             "saleTime",
             "saleStartTime",
             "startSaleTime",
@@ -75,6 +75,7 @@ class SaleGate:
             sale_time_ms=session_sale_time
             or _unique_millis(
                 dictionaries,
+                "sessionSaleTime",
                 "saleTime",
                 "saleStartTime",
                 "startSaleTime",

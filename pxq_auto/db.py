@@ -210,6 +210,7 @@ class Database:
         self,
         task_id: int,
         session_status: str,
+        sale_time_ms: int | None,
         plans: list[tuple[str, int, bool]],
     ) -> bool:
         now = time.time()
@@ -217,10 +218,13 @@ class Database:
         try:
             changed = self.connection.execute(
                 """
-                UPDATE tasks SET session_status = ?, updated_at = ?
+                UPDATE tasks
+                SET session_status = ?,
+                    sale_time_ms = COALESCE(?, sale_time_ms),
+                    updated_at = ?
                 WHERE id = ? AND status = 'active'
                 """,
-                (session_status, now, task_id),
+                (session_status, sale_time_ms, now, task_id),
             ).rowcount
             if not changed:
                 self.connection.rollback()
@@ -354,17 +358,15 @@ class Database:
             if not account:
                 raise ValueError(f"账号 #{account_id} 不存在")
             if account["status"] in {"RESERVED", "NEEDS_LOGIN"}:
-                raise ValueError("账号尚未登录，请先重新登录")
+                raise ValueError("账号尚未登录")
             if account["status"] in {"CREATED", "UNKNOWN"}:
-                raise ValueError("账号存在订单保护状态，请先人工核对并重置")
+                raise ValueError("账号存在订单保护状态")
             if account["status"] == "COMPLETE":
-                raise ValueError(
-                    f"原观演人均已购买；如需继续，请先发送“配置 {account_id}”更换观演人"
-                )
+                raise ValueError("原观演人均已购买")
             if not self.get_account_plans(account_id) or not self.get_audiences(
                 account_id
             ):
-                raise ValueError(f"账号配置不完整，请先发送“配置 {account_id}”")
+                raise ValueError("账号配置不完整")
             self.connection.execute(
                 """
                 UPDATE accounts

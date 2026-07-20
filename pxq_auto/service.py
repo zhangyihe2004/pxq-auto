@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
+from collections.abc import Awaitable
 from typing import Any
 
 from .api import PxqClient
@@ -10,8 +12,13 @@ from .db import Database
 
 SHOW_ID_RE = re.compile(r"(?<![0-9a-f])([0-9a-f]{24})(?![0-9a-f])", re.I)
 MIN_INTERVAL = 10
+PREWARM_SECONDS = 60
 ON_SALE_STATUSES = {"ONSALE", "ON_SALE", "LACK_OF_TICKET"}
 TERMINAL_STATUSES = {"SALE_END", "ENDED", "CANCELLED", "CANCELED", "OFF_SHELF"}
+
+
+class SessionUnavailable(RuntimeError):
+    pass
 
 
 def extract_show_id(value: str) -> str | None:
@@ -33,6 +40,23 @@ def parse_numbers(value: str, upper: int) -> list[int]:
     if not numbers or any(number < 1 or number > upper for number in numbers):
         raise ValueError(f"票档编号必须在 1~{upper} 之间")
     return numbers
+
+
+def sale_phase(task, plans, now_ms: int | None = None) -> str:
+    """Return PRESALE, PREWARM, AVAILABLE, ONSALE or WAITING."""
+    sale_time_ms = task["sale_time_ms"]
+    if sale_time_ms is not None:
+        current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        remaining = (sale_time_ms - current_ms) / 1000
+        if remaining > 0:
+            return "PREWARM" if remaining <= PREWARM_SECONDS else "PRESALE"
+    if task["session_status"].upper() in ON_SALE_STATUSES:
+        return (
+            "AVAILABLE"
+            if any(plan["sale_started"] and plan["can_buy_count"] > 0 for plan in plans)
+            else "ONSALE"
+        )
+    return "WAITING"
 
 
 class TaskService:
@@ -94,18 +118,34 @@ class TaskService:
         )
         return task_id, created
 
-    async def refresh_task(self, task) -> tuple[str, list[tuple[str, int, bool]]]:
+    async def refresh_task(
+        self,
+        task,
+        sessions_task: Awaitable[list[dict]] | None = None,
+    ) -> tuple[str, int | None, list[tuple[str, int, bool]]]:
         show_id, session_id = task["show_id"], task["session_id"]
-        sessions, plans = await asyncio.gather(
-            self.client.quick_order_sessions(show_id),
-            self.client.quick_order_plans(show_id, session_id),
+        plans_task = asyncio.create_task(
+            self.client.quick_order_plans(show_id, session_id)
         )
-        session = next(
-            (item for item in sessions if item.get("bizShowSessionId") == session_id),
-            None,
-        )
-        if session is None:
-            raise RuntimeError("目标场次已从公开接口移除")
+        try:
+            sessions = await (
+                sessions_task or self.client.quick_order_sessions(show_id)
+            )
+            session = next(
+                (
+                    item
+                    for item in sessions
+                    if item.get("bizShowSessionId") == session_id
+                ),
+                None,
+            )
+            if session is None:
+                raise SessionUnavailable("目标场次已从公开接口移除")
+            plans = await plans_task
+        finally:
+            if not plans_task.done():
+                plans_task.cancel()
+            await asyncio.gather(plans_task, return_exceptions=True)
         snapshot = [
             (
                 str(item["seatPlanId"]),
@@ -114,9 +154,11 @@ class TaskService:
             )
             for item in plans["seatPlans"]
         ]
-        return str(
-            session.get("sessionStatus") or session.get("bizSessionStatus") or ""
-        ), snapshot
+        return (
+            str(session.get("sessionStatus") or session.get("bizSessionStatus") or ""),
+            _sale_time(session),
+            snapshot,
+        )
 
 
 def _sale_time(value: Any) -> int | None:
@@ -146,7 +188,12 @@ def _session_sale_time(value: Any, session_id: str) -> int | None:
 def _walk(value: Any):
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"saleTime", "saleStartTime", "startSaleTime"}:
+            if key in {
+                "sessionSaleTime",
+                "saleTime",
+                "saleStartTime",
+                "startSaleTime",
+            }:
                 yield item
             yield from _walk(item)
     elif isinstance(value, list):

@@ -83,8 +83,9 @@ class FeishuLoginManager:
             touched_at=time.monotonic(),
         )
         return (
-            f"正在给抢票任务 #{task_id} 添加账号。\n"
-            "请发送 11 位手机号；系统会先检查全局唯一性，再发起登录请求。"
+            f"登录抢票任务 #{task_id} 的账号。\n"
+            "请发送 11 位手机号；系统会先检查全局唯一性，再发起登录请求。\n"
+            "退出：取消"
         )
 
     async def consume(self, command: IncomingCommand) -> str | None:
@@ -94,9 +95,20 @@ class FeishuLoginManager:
         session.last_message_id = command.message_id
         session.touched_at = time.monotonic()
         if command.text.strip() == "取消":
+            account_id = session.account_id
+            release = session.release_on_failure
             await self._drop(session, release=session.release_on_failure)
-            if session.account_id and not session.release_on_failure:
-                self.db.set_account_status(session.account_id, "NEEDS_LOGIN")
+            if account_id and not release:
+                status = self._failure_status(session)
+                self.db.set_account_status(account_id, status)
+                detail = (
+                    "账号资料和订单保护状态已保留。"
+                    if status in {"CREATED", "UNKNOWN", "COMPLETE"}
+                    else "账号资料已保留，状态为登录失效。"
+                )
+                return f"登录已取消；{detail}"
+            if release:
+                return "登录已取消；新账号占用已释放。"
             return "登录已取消。"
         try:
             if session.phase == "PHONE":
@@ -107,12 +119,12 @@ class FeishuLoginManager:
                 return await self._sms(session, command)
             raise RuntimeError("登录会话状态异常")
         except ValueError as exc:
-            return str(exc)
+            return f"{exc}\n退出：取消"
         except Exception as exc:
             await self._drop(session, release=session.release_on_failure)
             if session.account_id and not session.release_on_failure:
                 self.db.set_account_status(
-                    session.account_id, "NEEDS_LOGIN", error=str(exc)
+                    session.account_id, self._failure_status(session), error=str(exc)
                 )
             suffix = (
                 "手机号占用已释放"
@@ -133,12 +145,14 @@ class FeishuLoginManager:
             for session in expired:
                 await self._drop(session, release=session.release_on_failure)
                 if session.account_id and not session.release_on_failure:
-                    self.db.set_account_status(session.account_id, "NEEDS_LOGIN")
+                    self.db.set_account_status(
+                        session.account_id, self._failure_status(session)
+                    )
                 if session.last_message_id:
                     detail = (
                         "新手机号占用已释放。"
                         if session.release_on_failure
-                        else "账号资料已保留。"
+                        else f"账号资料已保留；可再次发送：登录 {session.task_id}"
                     )
                     await self.feishu.reply_text(
                         session.last_message_id,
@@ -148,6 +162,14 @@ class FeishuLoginManager:
     async def close(self) -> None:
         for session in list(self.sessions.values()):
             await self._drop(session, release=session.release_on_failure)
+
+    @staticmethod
+    def _failure_status(session: LoginSession) -> str:
+        return (
+            session.success_status
+            if session.success_status in {"CREATED", "UNKNOWN", "COMPLETE"}
+            else "NEEDS_LOGIN"
+        )
 
     async def _phone(self, session: LoginSession, command: IncomingCommand) -> str:
         phone = validate_phone(command.text)
@@ -224,12 +246,12 @@ class FeishuLoginManager:
         if result.success:
             session.phase = "SMS"
             await _wait_unique(login.locator(".code-step:visible"), "短信验证码步骤")
-            return "短信验证码已发送，请直接回复验证码。"
+            return "短信验证码已发送，请直接回复验证码。\n退出：取消"
         if result.code not in IMAGE_CODE_REQUIRED:
             raise RuntimeError(_api_error("发送短信验证码失败", result))
         session.phase = "IMAGE"
         await self._send_captcha(session, command.message_id)
-        return "请查看上一条验证码图片，直接回复 4 位图形验证码。"
+        return "请查看上一条验证码图片，直接回复 4 位图形验证码。\n退出：取消"
 
     async def cancel_account(self, account_id: int) -> None:
         for session in list(self.sessions.values()):
@@ -239,7 +261,7 @@ class FeishuLoginManager:
     async def _image(self, session: LoginSession, command: IncomingCommand) -> str:
         code = command.text.strip()
         if not code.isdigit() or len(code) != 4:
-            return "请回复 4 位数字图形验证码，或发送“取消”。"
+            return "请回复 4 位数字图形验证码。\n退出：取消"
         assert session.page is not None
         dialog = await _wait_unique(
             session.page.locator(".alertDialog:visible"), "图形验证码弹层"
@@ -260,10 +282,16 @@ class FeishuLoginManager:
                 session.login.locator(".code-step:visible"), "短信验证码步骤"
             )
             session.phase = "SMS"
-            return "图形验证码已通过，短信验证码已发送，请直接回复短信验证码。"
+            return (
+                "图形验证码已通过，短信验证码已发送，请直接回复短信验证码。\n"
+                "退出：取消"
+            )
         if result.code in IMAGE_CODE_REQUIRED:
             await self._send_captcha(session, command.message_id)
-            return f"图形验证码未通过：{result.message}\n已刷新图片，请重试。"
+            return (
+                f"图形验证码未通过：{result.message}\n"
+                "已刷新图片，请重试。\n退出：取消"
+            )
         raise RuntimeError(_api_error("图形验证码校验失败", result))
 
     async def _sms(self, session: LoginSession, command: IncomingCommand) -> str:
@@ -277,7 +305,7 @@ class FeishuLoginManager:
         length = int(await sms_input.get_attribute("maxlength") or "4")
         code = command.text.strip()
         if not code.isdigit() or len(code) != length:
-            return f"请回复 {length} 位短信验证码，或发送“取消”。"
+            return f"请回复 {length} 位短信验证码。\n退出：取消"
         await sms_input.fill("")
         async with session.page.expect_response(
             lambda response: _matches(response, LOGIN_PATH), timeout=10_000
@@ -285,7 +313,7 @@ class FeishuLoginManager:
             await sms_input.fill(code)
         result = await _read_result(await info.value)
         if not result.success:
-            return _api_error("短信验证码登录失败", result)
+            return f"{_api_error('短信验证码登录失败', result)}\n请重试。\n退出：取消"
         await session.login.wait_for(state="hidden", timeout=10_000)
         assert session.account_id is not None
         account_id = session.account_id

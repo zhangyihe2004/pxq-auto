@@ -108,6 +108,8 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
         return RunResult("NEEDS_LOGIN", "登录状态已失效")
     except InventoryUnavailable:
         return RunResult("NO_STOCK", "配置票档当前没有可售库存")
+    except StaticInventoryUnavailable:
+        return RunResult("NO_STOCK", "静态座位资源尚未下发")
     except Exception:
         await _save_failure(site, config, "prepare-failed")
         raise
@@ -131,11 +133,15 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             result = await watcher.wait(config.browser.timeout_ms / 1000)
         except TimeoutError:
             firewall.disarm()
+            blocked = _unexpected_posts(firewall)
             if firewall.attempt_allowed:
                 guard.unknown()
-                return RunResult("UNKNOWN", "创建请求已经发出，但没有观察到确定结果")
+                return RunResult(
+                    "UNKNOWN",
+                    "创建请求已经发出，但没有观察到确定结果" + blocked,
+                )
             guard.ready()
-            return RunResult("FAILED", "没有创建请求被放行")
+            return RunResult("FAILED", "没有创建请求被放行" + blocked)
         firewall.disarm()
 
         if result.success:
@@ -144,7 +150,7 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             fulfilled = tuple(person.masked_id for person in selected_people)
             removed.extend(item for item in fulfilled if item not in removed)
             remaining = len(people) - len(selected_people)
-            message = f"订单已创建（尝试 {attempt} 次），未支付"
+            message = f"订单已创建（尝试 {attempt} 次）"
             if remaining:
                 message += f"；本单 {len(selected_people)} 人，剩余 {remaining} 人将在本单处理并重置后继续等待"
             return RunResult(
@@ -177,7 +183,11 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             await _save_failure(site, config, "create-failed")
             return RunResult(
                 "UNKNOWN",
-                f"创建结果未知：code={result.code or '无'} {result.message or ''}",
+                (
+                    f"创建结果未知：code={result.code or '无'}"
+                    f" subCode={result.sub_code or '无'} {result.message or ''}"
+                    f"{_unexpected_posts(firewall)}"
+                ),
                 removed_audiences=tuple(removed),
             )
 
@@ -233,3 +243,9 @@ async def _save_failure(site: PiaoxingqiuPage, config: AppConfig, name: str) -> 
     with suppress(Exception):
         directory = config.browser.profile_dir.parent / "artifacts"
         await save_screenshot(site.page, directory, name)
+
+
+def _unexpected_posts(firewall: OrderFirewall) -> str:
+    if not firewall.unexpected_posts:
+        return ""
+    return "；已拦截未识别 POST：" + "、".join(sorted(firewall.unexpected_posts))
