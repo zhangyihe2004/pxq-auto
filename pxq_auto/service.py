@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from collections.abc import Awaitable
 from typing import Any
@@ -10,7 +9,6 @@ from .api import PxqClient
 from .db import Database
 
 
-SHOW_ID_RE = re.compile(r"(?<![0-9a-f])([0-9a-f]{24})(?![0-9a-f])", re.I)
 MIN_INTERVAL = 10
 PREWARM_SECONDS = 60
 ON_SALE_STATUSES = {"ONSALE", "ON_SALE", "LACK_OF_TICKET"}
@@ -19,11 +17,6 @@ TERMINAL_STATUSES = {"SALE_END", "ENDED", "CANCELLED", "CANCELED", "OFF_SHELF"}
 
 class SessionUnavailable(RuntimeError):
     pass
-
-
-def extract_show_id(value: str) -> str | None:
-    match = SHOW_ID_RE.search(value)
-    return match.group(1).lower() if match else None
 
 
 def parse_numbers(value: str, upper: int) -> list[int]:

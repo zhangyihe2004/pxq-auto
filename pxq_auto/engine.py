@@ -63,6 +63,7 @@ class AutoEngine:
         self.last_error_alert: dict[int, float] = {}
         self.pending_notices: dict[int, dict[str, PendingNotice]] = {}
         self.available_plans: dict[int, set[str]] = {}
+        self.phases: dict[int, str] = {}
 
     async def run_forever(self) -> None:
         log.info("自动抢票引擎启动")
@@ -185,6 +186,16 @@ class AutoEngine:
             return
 
         phase = sale_phase(task, plans, now_ms)
+        previous_phase = self.phases.get(task_id)
+        if phase != previous_phase:
+            log.info(
+                "抢票任务 #%s 阶段切换：%s -> %s（距开售 %s）",
+                task_id,
+                previous_phase or "初始",
+                phase,
+                "未知" if remaining is None else f"{remaining:.1f} 秒",
+            )
+            self.phases[task_id] = phase
         await self._update_stock_notice(task, plans, phase)
         presale = phase == "PREWARM"
         if self.system.create_order_enabled:
@@ -399,6 +410,7 @@ class AutoEngine:
             self.plan_missing,
             self.pending_notices,
             self.available_plans,
+            self.phases,
         ):
             for task_id in set(mapping) - active_ids:
                 mapping.pop(task_id, None)
@@ -412,20 +424,53 @@ class AutoEngine:
             self.plan_missing,
             self.pending_notices,
             self.available_plans,
+            self.phases,
         ):
             mapping.pop(task_id, None)
 
     def _start_account(self, account_id: int, *, presale: bool) -> None:
         if account_id in self.jobs:
+            log.debug("账号 #%s 已有执行任务，忽略重复启动", account_id)
             return
+        account = self.db.get_account(account_id)
+        task_id = int(account["task_id"]) if account else None
+        mode = "预售预热" if presale else "回流抢票"
+        log.info("任务 #%s 账号 #%s 已加入执行队列（%s）", task_id, account_id, mode)
         job = asyncio.create_task(
-            self._run_after_check(account_id, presale, self.checks.get(account_id))
+            self._run_after_check(account_id, presale, self.checks.get(account_id)),
+            name=f"pxq-account-{account_id}-{'presale' if presale else 'available'}",
         )
         self.jobs[account_id] = job
 
         def forget_job(_job: asyncio.Task) -> None:
             if self.jobs.get(account_id) is _job:
                 self.jobs.pop(account_id, None)
+            try:
+                outcome = _job.result()
+            except asyncio.CancelledError:
+                log.warning(
+                    "任务 #%s 账号 #%s 执行任务被取消（%s）",
+                    task_id,
+                    account_id,
+                    mode,
+                )
+            except Exception as exc:
+                log.error(
+                    "任务 #%s 账号 #%s 执行任务异常退出（%s）：%s",
+                    task_id,
+                    account_id,
+                    mode,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+            else:
+                log.info(
+                    "任务 #%s 账号 #%s 执行任务结束（%s）：%s",
+                    task_id,
+                    account_id,
+                    mode,
+                    outcome,
+                )
 
         job.add_done_callback(forget_job)
 
@@ -434,25 +479,37 @@ class AutoEngine:
         account_id: int,
         presale: bool,
         check: asyncio.Task | None,
-    ) -> None:
+    ) -> str:
         if check:
+            log.info("账号 #%s 启动抢票前取消正在进行的登录检查", account_id)
             check.cancel()
             await asyncio.gather(check, return_exceptions=True)
-        await self._run_account(account_id, presale)
+        return await self._run_account(account_id, presale)
 
-    async def _run_account(self, account_id: int, presale: bool) -> None:
+    async def _run_account(self, account_id: int, presale: bool) -> str:
         async with self.semaphore:
+            log.info(
+                "账号 #%s 获得执行权（%s）",
+                account_id,
+                "预售预热" if presale else "回流抢票",
+            )
             account = self.db.get_account(account_id)
-            if not account or not account["enabled"] or account["status"] != "READY":
-                return
+            if not account:
+                return "账号已不存在"
+            if not account["enabled"]:
+                return "账号未启动"
+            if account["status"] != "READY":
+                return f"账号状态为 {account['status']}"
             task = self.db.get_task(account["task_id"])
-            if not task or task["status"] != "active":
-                return
+            if not task:
+                return "任务已不存在"
+            if task["status"] != "active":
+                return f"任务状态为 {task['status']}"
             plans = self.db.get_account_plans(account_id)
             people = self.db.get_audiences(account_id)
             config = build_order_config(task, plans, people, account, self.system)
             if not self.db.claim_account(account_id):
-                return
+                return "账号状态竞争失败"
             try:
                 async with persistent_browser(config.browser) as context:
                     result = await run_account(config, context, presale=presale)
@@ -475,11 +532,11 @@ class AutoEngine:
                 await self._notify_result(
                     account_id, task, RunResult("FAILED", str(exc))
                 )
-                return
+                return "执行异常"
             self._apply_removed_audiences(account_id, result.removed_audiences)
             current = self.db.get_account(account_id)
             if current is None:
-                return
+                return "执行完成后账号已不存在"
             next_status = {
                 "CREATED": "CREATED",
                 "UNKNOWN": "UNKNOWN",
@@ -496,6 +553,7 @@ class AutoEngine:
             )
             if result.status not in {"NO_STOCK"}:
                 await self._notify_result(account_id, task, result)
+            return result.status
 
     async def _schedule_login_checks(self, task, remaining: float | None) -> None:
         interval = AuthGuard.interval(
@@ -603,22 +661,32 @@ class AutoEngine:
             ),
         )
 
-    async def cancel_account(self, account_id: int) -> None:
+    async def cancel_account(
+        self,
+        account_id: int,
+        *,
+        reason: str = "账号操作",
+    ) -> None:
         self.next_auth.pop(account_id, None)
         activities = [
             activity
             for activity in (self.jobs.get(account_id), self.checks.get(account_id))
             if activity
         ]
+        if activities:
+            log.warning("取消账号 #%s 后台任务：%s", account_id, reason)
         for activity in activities:
             activity.cancel()
         if activities:
             await asyncio.gather(*activities, return_exceptions=True)
 
-    async def cancel_task(self, task_id: int) -> None:
+    async def cancel_task(self, task_id: int, *, reason: str = "任务操作") -> None:
         await asyncio.gather(
             *(
-                self.cancel_account(account["id"])
+                self.cancel_account(
+                    account["id"],
+                    reason=f"{reason}（任务 #{task_id}）",
+                )
                 for account in self.db.list_accounts(task_id)
             )
         )

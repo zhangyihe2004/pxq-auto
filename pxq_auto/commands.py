@@ -12,7 +12,7 @@ from .feishu import FeishuGateway, IncomingCommand
 from .guard import PersistentOrderGuard
 from .login import FeishuLoginManager
 from .messages import next_step, status_label
-from .service import MIN_INTERVAL, TaskService, extract_show_id, sale_phase
+from .service import MIN_INTERVAL, TaskService, sale_phase
 
 
 SEARCH_TTL = 900
@@ -22,7 +22,7 @@ HELP = """票星球自动抢票
 
 【创建】
 搜索 <关键词>
-抢票 <搜索序号|showId|链接> [场次 <序号>] [间隔 <秒>]
+抢票 <搜索序号> [间隔 <秒>]
 
 【查看】
 列表
@@ -34,16 +34,13 @@ HELP = """票星球自动抢票
 启动 <账号ID>
 停止 <账号ID>
 解绑 <账号ID>
-重置 <账号ID>（确认无待支付订单后使用）
+重置 <账号ID>
 
 【任务】
-间隔 <任务ID> [秒]
-暂停 <任务ID> / 恢复 <任务ID> / 删除 <任务ID>
-
-配置必须发送“完成”后才保存，保存后还需明确“启动”；程序只创建待支付订单，永不支付。
-登录和配置的任意步骤均可发送“取消”，退出且不保存当前步骤。
-群聊中非管理员仅可使用搜索、列表和详情。
-群聊使用时每条消息都要先 @机器人。"""
+间隔 <任务ID> <秒>
+暂停 <任务ID>
+恢复 <任务ID>
+删除 <任务ID>"""
 
 
 class CommandWorker:
@@ -178,34 +175,42 @@ class CommandWorker:
         lines.extend(("", "发送：抢票 <搜索序号>"))
         return "\n".join(lines)
 
-    def _target(self, command: IncomingCommand, value: str) -> str | None:
-        if value.isdigit() and len(value) <= 3:
-            cached = self.searches.get(self._key(command))
-            if not cached:
-                return None
-            if time.monotonic() - cached[0] >= SEARCH_TTL:
-                self.searches.pop(self._key(command), None)
-                return None
-            index = int(value)
-            if 1 <= index <= len(cached[1]):
-                return extract_show_id(str(cached[1][index - 1].get("showId") or ""))
+    def _search_show_id(self, command: IncomingCommand, value: str) -> str | None:
+        if not value.isdigit():
             return None
-        return extract_show_id(value)
+        cached = self.searches.get(self._key(command))
+        if not cached:
+            return None
+        if time.monotonic() - cached[0] >= SEARCH_TTL:
+            self.searches.pop(self._key(command), None)
+            return None
+        index = int(value)
+        if 1 <= index <= len(cached[1]):
+            return str(cached[1][index - 1].get("showId") or "") or None
+        return None
 
     async def _create(self, command: IncomingCommand, parts: list[str]) -> str:
-        usage = "发送：抢票 <序号|showId|链接> [场次 <序号>] [间隔 <秒>]"
+        usage = "发送：抢票 <搜索序号> [间隔 <秒>]"
         if len(parts) < 2:
             return usage
-        show_id = self._target(command, parts[1])
+        show_id = self._search_show_id(command, parts[1])
         if not show_id:
-            return "无法解析演出，请先重新搜索。"
+            return "搜索序号无效或结果已过期，请重新搜索。"
         options = {"场次": "", "间隔": "60"}
+        interval_given = False
         index = 2
         while index < len(parts):
             if parts[index] not in options or index + 1 >= len(parts):
                 return usage
+            if parts[index] == "间隔":
+                interval_given = True
             options[parts[index]] = parts[index + 1]
             index += 2
+        if not options["间隔"].isdigit():
+            return "间隔必须是整数秒。"
+        if options["场次"] and not options["场次"].isdigit():
+            return "场次序号必须是数字。"
+        requested_interval = int(options["间隔"])
         show_name, sessions = await self.service.show_sessions(show_id)
         if not sessions:
             return "该演出当前没有场次。"
@@ -215,18 +220,12 @@ class CommandWorker:
                 f"{number}. {session.get('sessionName', '')}"
                 for number, session in enumerate(sessions, 1)
             )
-            lines.extend(
-                (
-                    "",
-                    f"发送：抢票 {parts[1]} 场次 <序号> 间隔 {options['间隔']}",
-                )
-            )
+            followup = f"发送：抢票 {parts[1]} 场次 <序号>"
+            if interval_given:
+                followup += f" 间隔 {options['间隔']}"
+            lines.extend(("", followup))
             return "\n".join(lines)
-        try:
-            session_number = int(options["场次"] or "1")
-            requested_interval = int(options["间隔"])
-        except ValueError:
-            return "场次和间隔必须是数字。"
+        session_number = int(options["场次"] or "1")
         if not 1 <= session_number <= len(sessions):
             return f"场次编号必须在 1~{len(sessions)} 之间。"
         interval = max(MIN_INTERVAL, requested_interval)
@@ -361,17 +360,12 @@ class CommandWorker:
         return f"已{name}任务 #{task_id}。"
 
     def _interval(self, parts: list[str]) -> str:
-        if len(parts) not in {2, 3} or not parts[1].isdigit():
-            return "发送：间隔 <任务ID> [秒]"
+        if len(parts) != 3 or not parts[1].isdigit():
+            return "发送：间隔 <任务ID> <秒>"
         task_id = int(parts[1])
         task = self.db.get_task(task_id)
         if not task:
             return f"任务 #{task_id} 不存在。"
-        if len(parts) == 2:
-            return (
-                f"任务 #{task_id} 当前间隔：{task['interval_sec']} 秒\n"
-                f"修改：间隔 {task_id} <秒>（最低 {MIN_INTERVAL} 秒）"
-            )
         if not parts[2].isdigit():
             return "间隔必须是整数秒。"
         requested = int(parts[2])

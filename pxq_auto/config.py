@@ -217,7 +217,7 @@ def mask_id(value: str) -> str:
         or not re.fullmatch(r"\d{3}", parts[0])
         or not re.fullmatch(r"[0-9Xx]{4}", parts[1])
     ):
-        raise ValueError("身份证号只需输入前 3 位和后 4 位，如 210 2534")
+        raise ValueError("身份证号只需输入前 3 位和后 4 位，如 110 2321")
     return f"{parts[0]}{'*' * 11}{parts[1].upper()}"
 
 
