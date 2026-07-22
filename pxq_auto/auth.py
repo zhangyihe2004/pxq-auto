@@ -49,7 +49,7 @@ class AuthGuard:
         if allow_refresh:
             await self.refresh()
             return
-        raise AuthenticationError("登录状态失效，已停止")
+        raise AuthenticationRequired("登录状态失效，请通过飞书重新登录")
 
     async def require_recent(self, max_age: float = 5.0) -> None:
         if asyncio.get_running_loop().time() - self._verified_at <= max_age:
@@ -74,7 +74,9 @@ class AuthGuard:
         if not response.ok:
             raise AuthenticationError(f"登录检查返回 HTTP {response.status}")
         payload = await response.json()
-        if not isinstance(payload, dict) or str(payload.get("statusCode")) != "200":
+        if not isinstance(payload, dict):
+            raise AuthenticationError("登录检查响应不是 JSON 对象")
+        if str(payload.get("statusCode")) != "200":
             self.show_user_data = {}
             self._verified_at = 0.0
             return False

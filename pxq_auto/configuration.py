@@ -172,14 +172,11 @@ class AccountConfigurator:
             masked_id = mask_id(" ".join(parts[-2:]))
         except ValueError as exc:
             return self._people_prompt(session, str(exc))
-        person = (name, masked_id)
         if not name:
             return self._people_prompt(session, "姓名不能为空。")
-        if person in session.people or any(
-            existing_id == masked_id for _, existing_id in session.people
-        ):
+        if any(existing_id == masked_id for _, existing_id in session.people):
             return self._people_prompt(session, "该观演人已经添加，不需要重复发送。")
-        session.people.append(person)
+        session.people.append((name, masked_id))
         return self._people_prompt(session, f"已添加：{name}。")
 
     def _plans_prompt(self, session: ConfigSession, notice: str = "") -> str:

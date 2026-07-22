@@ -6,8 +6,9 @@ import heapq
 import math
 import re
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlencode
 
 import geobuf
@@ -18,7 +19,12 @@ from .site import PiaoxingqiuPage, is_success_payload
 BATCH_SIZE = 25
 DYNAMIC_CONCURRENCY = 4
 DOWNLOAD_CONCURRENCY = 5
+FAST_STOCK_POLL_SECONDS = 0.25
+FAST_STOCK_WINDOW_SECONDS = 5.0
+STOCK_POLL_SECONDS = 1.0
+STOCK_WAIT_SECONDS = 60.0
 STATIC_UNAVAILABLE_CODE = "22024036"
+T = TypeVar("T")
 
 
 class InventoryUnavailable(RuntimeError):
@@ -34,7 +40,6 @@ class Seat:
     zone_id: str
     zone_name: str
     seat_id: str
-    seat_name: str
     row: str
     seat_no: int
     x: float
@@ -103,12 +108,13 @@ class GeneralAdmissionInventory:
     plan_ids: tuple[str, ...]
 
     @classmethod
-    async def open(
+    def open(
         cls,
         site: PiaoxingqiuPage,
         auth: AuthGuard,
     ) -> GeneralAdmissionInventory:
-        show_id, session_id, origin = await _show_session_origin(site)
+        show_id, session_id = site.booking_ids
+        origin = site.origin
         if not auth.headers:
             raise RuntimeError("库存查询缺少已验证的登录状态")
         return cls(
@@ -159,13 +165,7 @@ class GeneralAdmissionInventory:
         return full or max(options, key=lambda option: option.quantity)
 
     async def wait_available(self, quantity: int) -> GeneralAdmissionSelection:
-        started = asyncio.get_running_loop().time()
-        while True:
-            try:
-                return await self.refresh(quantity)
-            except InventoryUnavailable:
-                elapsed = asyncio.get_running_loop().time() - started
-                await asyncio.sleep(0.25 if elapsed < 10 else 1.0)
+        return await _wait_inventory(lambda: self.refresh(quantity))
 
 
 @dataclass
@@ -177,15 +177,15 @@ class InventoryBootstrap:
     headers: dict[str, str]
     plan_names: tuple[str, ...]
     plan_ids: tuple[str, ...]
-    static_data: dict[str, Any]
 
     @classmethod
-    async def open(
+    def open(
         cls,
         site: PiaoxingqiuPage,
         auth: AuthGuard,
     ) -> InventoryBootstrap:
-        show_id, session_id, origin = await _show_session_origin(site)
+        show_id, session_id = site.booking_ids
+        origin = site.origin
         headers = auth.headers
         if not headers:
             raise RuntimeError("库存预热缺少已验证的登录状态")
@@ -198,10 +198,6 @@ class InventoryBootstrap:
             common,
         )
         site.prefilled_plan_id = _prefilled_plan_id(auth.show_user_data, session_id)
-        static_response = await site.page.context.request.get(static_url)
-        if not static_response.ok:
-            raise RuntimeError(f"静态座位接口返回 HTTP {static_response.status}")
-        static_data = _static_data(await static_response.json())
         return cls(
             site=site,
             endpoint=f"{root}/buyer/v5/show/{show_id}/session/{session_id}/seating/dynamic",
@@ -210,20 +206,17 @@ class InventoryBootstrap:
             headers=headers,
             plan_names=plan_names,
             plan_ids=plan_ids,
-            static_data=static_data,
         )
 
-    async def activate(self, *, refresh: bool = False) -> Inventory:
-        static_data = self.static_data
-        if refresh:
-            response = await self.site.page.context.request.get(self.static_url)
-            if response.status in {401, 429, 469}:
-                raise RuntimeError(
-                    f"静态座位接口触发限制（HTTP {response.status}），已停止"
-                )
-            if not response.ok:
-                raise RuntimeError(f"静态座位接口返回 HTTP {response.status}")
-            static_data = _static_data(await response.json())
+    async def activate(self) -> Inventory:
+        response = await self.site.page.context.request.get(self.static_url)
+        if response.status in {401, 429, 469}:
+            raise RuntimeError(
+                f"静态座位接口触发限制（HTTP {response.status}），已停止"
+            )
+        if not response.ok:
+            raise RuntimeError(f"静态座位接口返回 HTTP {response.status}")
+        static_data = _static_data(await response.json())
         resources = {
             str(item["zoneConcreteId"]): str(item["url"])
             for item in static_data.get("staticResList", [])
@@ -242,7 +235,7 @@ class InventoryBootstrap:
             ),
             None,
         )
-        if not resources or venue_url is None:
+        if not resources:
             raise StaticInventoryUnavailable("静态座位资源尚未下发")
         return Inventory(
             site=self.site,
@@ -252,18 +245,13 @@ class InventoryBootstrap:
             plan_names=self.plan_names,
             plan_ids=self.plan_ids,
             resources=resources,
-            venue=await _decode_venue_geometry(self.site, venue_url),
+            venue_url=venue_url,
+            venue=None,
             zones={},
         )
 
     async def wait_static(self) -> Inventory:
-        started = asyncio.get_running_loop().time()
-        while True:
-            try:
-                return await self.activate(refresh=True)
-            except StaticInventoryUnavailable:
-                elapsed = asyncio.get_running_loop().time() - started
-                await asyncio.sleep(0.25 if elapsed < 10 else 1.0)
+        return await _wait_inventory(self.activate)
 
 
 @dataclass
@@ -275,12 +263,13 @@ class Inventory:
     plan_names: tuple[str, ...]
     plan_ids: tuple[str, ...]
     resources: dict[str, str]
-    venue: VenueGeometry
+    venue_url: str | None
+    venue: VenueGeometry | None
     zones: dict[str, tuple[Seat, ...]]
 
     @classmethod
     async def open(cls, site: PiaoxingqiuPage, auth: AuthGuard) -> Inventory:
-        return await (await InventoryBootstrap.open(site, auth)).activate()
+        return await InventoryBootstrap.open(site, auth).activate()
 
     async def refresh(
         self,
@@ -323,17 +312,36 @@ class Inventory:
         missing = live_zone_ids - self.zones.keys()
         if missing:
             self.zones.update(await _decode_zones(self.site, self.resources, missing))
-        available = tuple(
-            candidate
-            for (rank, plan_name, plan_id), bitsets in inventories.items()
-            for zone_id, bits in bitsets.items()
-            for candidate in _rank_zone(
+
+        available_zones = [
+            (
+                rank,
+                plan_name,
+                plan_id,
                 self.zones[zone_id],
                 tuple(
                     seat
                     for seat in self.zones[zone_id]
                     if _bit_is_set(bits, seat.seat_no)
                 ),
+            )
+            for (rank, plan_name, plan_id), bitsets in inventories.items()
+            for zone_id, bits in bitsets.items()
+        ]
+        mapped_count = sum(len(item[4]) for item in available_zones)
+        if not mapped_count:
+            raise RuntimeError("动态库存存在，但未能映射到静态座位")
+        selected_quantity = min(quantity, mapped_count)
+        if selected_quantity > 1 and self.venue is None:
+            if self.venue_url is None:
+                raise RuntimeError("多人选座缺少全场几何资源")
+            self.venue = await _decode_venue_geometry(self.site, self.venue_url)
+        available = tuple(
+            candidate
+            for rank, plan_name, plan_id, seats, live_seats in available_zones
+            for candidate in _rank_zone(
+                seats,
+                live_seats,
                 self.venue,
                 plan_name,
                 plan_id,
@@ -343,13 +351,13 @@ class Inventory:
         selected = next(
             (
                 group
-                for selected_quantity in range(quantity, 0, -1)
-                if (group := _select_group(available, selected_quantity)) is not None
+                for current_quantity in range(selected_quantity, 0, -1)
+                if (group := _select_group(available, current_quantity)) is not None
             ),
             None,
         )
         if selected is None:
-            raise RuntimeError("动态库存存在，但未能映射到静态座位")
+            raise RuntimeError("可售座位无法组成有效选择")
         selected_candidates = tuple(
             sorted(
                 selected.candidates,
@@ -359,18 +367,28 @@ class Inventory:
         return SeatSelection(candidates=selected_candidates)
 
     async def wait_available(self, quantity: int) -> SeatSelection:
-        started = asyncio.get_running_loop().time()
-        while True:
-            try:
-                return await self.refresh(quantity)
-            except InventoryUnavailable:
-                elapsed = asyncio.get_running_loop().time() - started
-                await asyncio.sleep(0.25 if elapsed < 10 else 1.0)
+        return await _wait_inventory(lambda: self.refresh(quantity))
 
 
-async def _show_session_origin(site: PiaoxingqiuPage) -> tuple[str, str, str]:
-    show_id, session_id = site.booking_ids
-    return show_id, session_id, site.origin
+async def _wait_inventory(load: Callable[[], Awaitable[T]]) -> T:
+    started = asyncio.get_running_loop().time()
+    while True:
+        try:
+            return await load()
+        except (InventoryUnavailable, StaticInventoryUnavailable):
+            elapsed = asyncio.get_running_loop().time() - started
+            if elapsed >= STOCK_WAIT_SECONDS:
+                raise
+            await asyncio.sleep(_stock_poll_delay(elapsed))
+
+
+def _stock_poll_delay(elapsed: float) -> float:
+    interval = (
+        FAST_STOCK_POLL_SECONDS
+        if elapsed < FAST_STOCK_WINDOW_SECONDS
+        else STOCK_POLL_SECONDS
+    )
+    return min(interval, STOCK_WAIT_SECONDS - elapsed)
 
 
 def _prefilled_plan_id(data: dict[str, Any], session_id: str) -> str | None:
@@ -556,12 +574,14 @@ def _seat(feature: Any, zone_id: str) -> Seat | None:
         or len(coordinates) < 2
     ):
         return None
+    seat_id = str(properties.get("seatConcreteId") or "")
+    if not seat_id:
+        return None
     try:
         return Seat(
             zone_id=zone_id,
             zone_name=str(properties.get("zoneName") or zone_id),
-            seat_id=str(properties.get("seatConcreteId") or ""),
-            seat_name=str(properties.get("seatName") or ""),
+            seat_id=seat_id,
             row=str(properties.get("row") or ""),
             seat_no=int(properties["seatNo"]),
             x=float(coordinates[0]),
@@ -579,13 +599,18 @@ def _bit_is_set(bits: bytes, seat_no: int) -> bool:
 def _rank_zone(
     seats: tuple[Seat, ...],
     available: tuple[Seat, ...],
-    venue: VenueGeometry,
+    venue: VenueGeometry | None,
     plan: str,
     plan_id: str,
     plan_rank: int,
 ) -> tuple[Candidate, ...]:
     if not seats or not available:
         return ()
+    if venue is None:
+        return tuple(
+            Candidate(seat, plan, plan_id, plan_rank, seat.seat_no)
+            for seat in available
+        )
     zone = _zone_geometry(venue, seats[0])
     radial_x = zone.center[0] - venue.center[0]
     radial_y = zone.center[1] - venue.center[1]

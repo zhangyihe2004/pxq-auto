@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import os
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
-from playwright.async_api import BrowserContext, Playwright, async_playwright
+from playwright.async_api import BrowserContext, Error, Playwright, async_playwright
 
 from .config import BrowserConfig
 
@@ -29,6 +30,7 @@ async def persistent_browser(config: BrowserConfig):
             ),
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
+            env={**os.environ, "CHROME_LOG_FILE": os.devnull},
         )
         context.set_default_timeout(config.timeout_ms)
         yield context
@@ -44,8 +46,10 @@ async def persistent_browser(config: BrowserConfig):
         raise
     finally:
         if context is not None:
-            await context.close()
-        await playwright.stop()
+            with suppress(Error):
+                await context.close()
+        with suppress(Error):
+            await playwright.stop()
 
 
 async def save_screenshot(page, directory: Path, name: str) -> Path:

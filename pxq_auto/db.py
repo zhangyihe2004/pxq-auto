@@ -7,6 +7,9 @@ from pathlib import Path
 from .config import profile_key
 
 
+_UNCHANGED = object()
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY,
@@ -79,13 +82,6 @@ class Database:
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 15000")
         self.connection.executescript(SCHEMA)
-        with self.connection:
-            self.connection.execute(
-                """
-                UPDATE accounts SET enabled = 0, status = 'STOPPED'
-                WHERE status = 'RUNNING'
-                """
-            )
 
     def close(self) -> None:
         self.connection.close()
@@ -129,6 +125,7 @@ class Database:
         session_name: str,
         support_seat_picking: bool,
         interval_sec: int,
+        session_status: str,
         sale_time_ms: int | None,
         plans: list[dict],
     ) -> tuple[int, bool]:
@@ -147,9 +144,9 @@ class Database:
                 """
                 INSERT INTO tasks (
                     id, show_id, show_name, session_id, session_name,
-                    support_seat_picking, interval_sec, sale_time_ms,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    support_seat_picking, interval_sec, session_status,
+                    sale_time_ms, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -159,6 +156,7 @@ class Database:
                     session_name,
                     int(support_seat_picking),
                     interval_sec,
+                    session_status,
                     sale_time_ms,
                     now,
                     now,
@@ -220,7 +218,7 @@ class Database:
                 """
                 UPDATE tasks
                 SET session_status = ?,
-                    sale_time_ms = COALESCE(?, sale_time_ms),
+                    sale_time_ms = ?,
                     updated_at = ?
                 WHERE id = ? AND status = 'active'
                 """,
@@ -229,6 +227,14 @@ class Database:
             if not changed:
                 self.connection.rollback()
                 return False
+            self.connection.execute(
+                """
+                UPDATE task_plans
+                SET can_buy_count = 0, sale_started = 0, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (now, task_id),
+            )
             self.connection.executemany(
                 """
                 UPDATE task_plans
@@ -246,11 +252,17 @@ class Database:
             self.connection.rollback()
             raise
 
-    def set_task_status(self, task_id: int, status: str) -> bool:
+    def set_task_status(
+        self, task_id: int, status: str, *, current_status: str | None = None
+    ) -> bool:
+        condition = " AND status = ?" if current_status is not None else ""
+        parameters = [status, time.time(), task_id]
+        if current_status is not None:
+            parameters.append(current_status)
         return bool(
             self.connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (status, time.time(), task_id),
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?" + condition,
+                parameters,
             ).rowcount
         )
 
@@ -332,22 +344,34 @@ class Database:
         account_id: int,
         status: str,
         *,
-        order_id: str | None = None,
+        order_id: str | None | object = _UNCHANGED,
         error: str = "",
     ) -> bool:
+        keep_order_id = order_id is _UNCHANGED
         return bool(
             self.connection.execute(
                 """
                 UPDATE accounts
                 SET status = ?,
                     enabled = CASE
-                        WHEN ? IN ('NEEDS_LOGIN', 'CREATED', 'UNKNOWN', 'COMPLETE')
+                        WHEN ? IN (
+                            'STOPPED', 'NEEDS_LOGIN', 'CREATED', 'UNKNOWN', 'COMPLETE'
+                        )
                         THEN 0 ELSE enabled
                     END,
-                    order_id = ?, last_error = ?, updated_at = ?
+                    order_id = CASE WHEN ? THEN order_id ELSE ? END,
+                    last_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, status, order_id, error, time.time(), account_id),
+                (
+                    status,
+                    status,
+                    int(keep_order_id),
+                    None if keep_order_id else order_id,
+                    error,
+                    time.time(),
+                    account_id,
+                ),
             ).rowcount
         )
 
@@ -424,23 +448,16 @@ class Database:
             ).rowcount
         )
 
-    def replace_audiences(self, account_id: int, people: list[tuple[str, str]]) -> None:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
+    def remove_audiences(self, account_id: int, masked_ids: tuple[str, ...]) -> None:
+        if not masked_ids:
+            return
+        placeholders = ",".join("?" for _ in masked_ids)
+        with self.connection:
             self.connection.execute(
-                "DELETE FROM audiences WHERE account_id = ?", (account_id,)
+                f"DELETE FROM audiences WHERE account_id = ? "
+                f"AND masked_id IN ({placeholders})",
+                (account_id, *masked_ids),
             )
-            self.connection.executemany(
-                "INSERT INTO audiences (account_id, position, name, masked_id) VALUES (?, ?, ?, ?)",
-                [
-                    (account_id, position, name, masked_id)
-                    for position, (name, masked_id) in enumerate(people, 1)
-                ],
-            )
-            self.connection.commit()
-        except Exception:
-            self.connection.rollback()
-            raise
 
     def get_audiences(self, account_id: int) -> list[sqlite3.Row]:
         return self.connection.execute(
@@ -457,8 +474,8 @@ class Database:
         """校验并以一个事务同时替换票档、观演人和运行状态。"""
         if not plan_ids or len(plan_ids) != len(set(plan_ids)):
             raise ValueError("至少选择一个不重复的票档")
-        if not people or len(people) != len(set(people)):
-            raise ValueError("至少添加一位不重复的观演人")
+        if not people:
+            raise ValueError("至少添加一位观演人")
         masked_ids = [masked_id for _, masked_id in people]
         if len(masked_ids) != len(set(masked_ids)):
             raise ValueError("同一证件不能重复添加")

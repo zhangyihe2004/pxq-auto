@@ -4,7 +4,7 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
 
-from .auth import AuthGuard, AuthenticationError, AuthenticationRequired
+from .auth import AuthGuard, AuthenticationRequired
 from .browser import save_screenshot
 from .config import AppConfig
 from .guard import OrderFirewall, PersistentOrderGuard
@@ -15,7 +15,7 @@ from .inventory import (
     InventoryUnavailable,
     StaticInventoryUnavailable,
 )
-from .presale import SaleGate
+from .presale import SaleGate, SaleUnavailable
 from .site import (
     CreateResponseWatcher,
     PiaoxingqiuPage,
@@ -34,7 +34,7 @@ class RunResult:
     removed_audiences: tuple[str, ...] = ()
 
 
-async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult:
+async def run_account(config: AppConfig, context, *, prewarm: bool) -> RunResult:
     """执行一个账号的一次自动抢票生命周期，最多成功创建一个订单。"""
     if not config.create_order:
         return RunResult("DISABLED", "全局 create_order_enabled 尚未开启")
@@ -59,17 +59,18 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
     removed: list[str] = []
     try:
         if not config.project.support_seat_picking:
-            if presale:
+            if prewarm:
                 gate = SaleGate(site)
                 sale = await gate.fetch()
                 if not sale.on_sale:
                     sale = await gate.wait_until_prewarm(sale, auth)
                     if not sale.on_sale:
                         await gate.wait_until_sale(sale, auth)
-            general_source = await GeneralAdmissionInventory.open(site, auth)
-            if presale:
-                general_selection, _ = await asyncio.gather(
-                    general_source.wait_available(len(people)), site.open_purchase()
+            general_source = GeneralAdmissionInventory.open(site, auth)
+            if prewarm:
+                general_selection = await _parallel_result(
+                    general_source.wait_available(len(people)),
+                    site.open_purchase(),
                 )
             else:
                 general_selection = await general_source.refresh(len(people))
@@ -77,25 +78,26 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             prepared = await site.prepare_general_order(
                 general_selection, selected_people
             )
-        elif presale:
+        elif prewarm:
             gate = SaleGate(site)
             sale = await gate.fetch()
             if not sale.on_sale:
                 sale = await gate.wait_until_prewarm(sale, auth)
-                bootstrap = await InventoryBootstrap.open(site, auth)
+                bootstrap = InventoryBootstrap.open(site, auth)
                 with suppress(StaticInventoryUnavailable):
                     seat_source = await bootstrap.activate()
                 if not sale.on_sale:
                     await gate.wait_until_sale(sale, auth)
             if bootstrap is None:
-                bootstrap = await InventoryBootstrap.open(site, auth)
+                bootstrap = InventoryBootstrap.open(site, auth)
 
             async def wait_selection():
                 current = seat_source or await bootstrap.wait_static()
                 return current, await current.wait_available(len(people))
 
-            (seat_source, seat_selection), _ = await asyncio.gather(
-                wait_selection(), site.open_purchase()
+            seat_source, seat_selection = await _parallel_result(
+                wait_selection(),
+                site.open_purchase(),
             )
             selected_people = people[: len(seat_selection.candidates)]
             prepared = await site.prepare_order(seat_selection, selected_people)
@@ -104,12 +106,12 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             seat_selection = await seat_source.refresh(len(people))
             selected_people = people[: len(seat_selection.candidates)]
             prepared = await site.prepare_order(seat_selection, selected_people)
-    except AuthenticationError:
+    except AuthenticationRequired:
         return RunResult("NEEDS_LOGIN", "登录状态已失效")
-    except InventoryUnavailable:
-        return RunResult("NO_STOCK", "配置票档当前没有可售库存")
+    except (InventoryUnavailable, SaleUnavailable):
+        return RunResult("RESTOCK", "配置票档当前没有可售库存")
     except StaticInventoryUnavailable:
-        return RunResult("NO_STOCK", "静态座位资源尚未下发")
+        return RunResult("RESTOCK", "静态座位资源尚未下发")
     except Exception:
         await _save_failure(site, config, "prepare-failed")
         raise
@@ -120,14 +122,24 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
     attempt = 0
     while True:
         attempt += 1
-        await auth.require_recent()
+        try:
+            await auth.require_recent()
+        except AuthenticationRequired:
+            return RunResult("NEEDS_LOGIN", "提交前登录状态已失效")
         firewall.arm_once()
         guard.submitting()
         try:
             await site._click_action(prepared)
-        except Exception:
+        except Exception as exc:
             firewall.disarm()
-            guard.unknown() if firewall.attempt_allowed else guard.ready()
+            if firewall.attempt_allowed:
+                guard.unknown()
+                return RunResult(
+                    "UNKNOWN",
+                    f"创建请求可能已经发出，但点击流程异常：{exc}",
+                    removed_audiences=tuple(removed),
+                )
+            guard.ready()
             raise
         try:
             result = await watcher.wait(config.browser.timeout_ms / 1000)
@@ -145,7 +157,7 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
         firewall.disarm()
 
         if result.success:
-            order_id = result.order_id or await site.find_created_order_id()
+            order_id = result.order_id
             guard.created(order_id)
             fulfilled = tuple(person.masked_id for person in selected_people)
             removed.extend(item for item in fulfilled if item not in removed)
@@ -195,8 +207,9 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             if config.project.support_seat_picking:
                 if seat_source is None:
                     raise RuntimeError("选座库存状态无效")
-                _, seat_selection = await asyncio.gather(
-                    site.reopen_seat_map(), seat_source.refresh(len(people))
+                seat_selection = await _parallel_result(
+                    seat_source.refresh(len(people)),
+                    site.reopen_seat_map(),
                 )
                 selected_people = people[: len(seat_selection.candidates)]
                 prepared = await site.prepare_order(
@@ -205,14 +218,15 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             else:
                 if general_source is None:
                     raise RuntimeError("票档库存状态无效")
-                _, general_selection = await asyncio.gather(
-                    site.open_purchase(), general_source.refresh(len(people))
+                general_selection = await _parallel_result(
+                    general_source.refresh(len(people)),
+                    site.open_purchase(),
                 )
                 selected_people = people[: general_selection.quantity]
                 prepared = await site.prepare_general_order(
                     general_selection, selected_people
                 )
-        except AuthenticationError:
+        except AuthenticationRequired:
             return RunResult(
                 "NEEDS_LOGIN",
                 "冲突恢复时登录状态已失效",
@@ -220,13 +234,26 @@ async def run_account(config: AppConfig, context, *, presale: bool) -> RunResult
             )
         except InventoryUnavailable:
             return RunResult(
-                "NO_STOCK",
+                "RESTOCK",
                 "冲突后刷新实时库存，当前已无可售票",
                 removed_audiences=tuple(removed),
             )
         except Exception:
             await _save_failure(site, config, "recover-failed")
             raise
+
+
+async def _parallel_result(result_coro, side_coro):
+    result = asyncio.create_task(result_coro)
+    side = asyncio.create_task(side_coro)
+    try:
+        value, _ = await asyncio.gather(result, side)
+        return value
+    except BaseException:
+        result.cancel()
+        side.cancel()
+        await asyncio.gather(result, side, return_exceptions=True)
+        raise
 
 
 async def check_login(config: AppConfig, context) -> bool:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -12,10 +13,11 @@ import httpx
 from . import __version__
 from .api import PxqClient, PxqError
 from .commands import CommandWorker
-from .config import CONFIG_PATH, DB_PATH, load_system_config
+from .config import CONFIG_PATH, DB_PATH, account_home, load_system_config
 from .db import Database
 from .engine import AutoEngine
 from .feishu import FeishuError, FeishuGateway, IncomingCommand
+from .guard import PersistentOrderGuard
 from .login import FeishuLoginManager
 from .service import TaskService
 
@@ -61,6 +63,7 @@ async def _serve() -> None:
     )
     system = load_system_config()
     db = Database(DB_PATH)
+    _recover_accounts(db)
     client = PxqClient()
     queue: asyncio.Queue[IncomingCommand] = asyncio.Queue(maxsize=100)
     feishu = FeishuGateway(system.raw, queue)
@@ -101,12 +104,22 @@ def _doctor() -> None:
         raise ValueError(
             "Playwright 未安装，请执行 python -m pip install -e ."
         ) from exc
-    with sync_playwright() as playwright:
-        chromium = playwright.chromium.executable_path
-    if not Path(chromium).is_file():
-        raise ValueError(
-            "Chromium 未安装，请执行 python -m playwright install chromium"
-        )
+    try:
+        with sync_playwright() as playwright:
+            chromium = playwright.chromium.executable_path
+            if not Path(chromium).is_file():
+                raise ValueError(
+                    "Chromium 未安装，请执行 python -m playwright install chromium"
+                )
+            browser = playwright.chromium.launch(
+                headless=True,
+                env={**os.environ, "CHROME_LOG_FILE": os.devnull},
+            )
+            browser.close()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Chromium 无法启动：{exc}") from exc
     print("环境检查")
     print(f"配置：{CONFIG_PATH}")
     print(f"数据库：{DB_PATH}")
@@ -115,6 +128,28 @@ def _doctor() -> None:
     print(f"账号并发：{system.max_concurrent_accounts}")
     print(f"创建订单：{'已启用' if system.create_order_enabled else '已禁用'}")
     print("检查：通过")
+
+
+def _recover_accounts(db: Database) -> None:
+    for account in db.list_accounts():
+        path = account_home(account["profile_key"]) / "order-state.json"
+        try:
+            state = PersistentOrderGuard.load(path)
+        except (OSError, ValueError, KeyError, TypeError):
+            db.set_account_status(
+                account["id"], "UNKNOWN", error="订单保护文件损坏，请人工核对"
+            )
+            continue
+        if state and state.status in {"SUBMITTING", "CREATED", "UNKNOWN"}:
+            status = "UNKNOWN" if state.status == "SUBMITTING" else state.status
+            db.set_account_status(
+                account["id"],
+                status,
+                order_id=state.order_id,
+                error="服务在创建订单时中断，请人工核对" if status == "UNKNOWN" else "",
+            )
+        elif account["status"] == "RUNNING":
+            db.set_account_status(account["id"], "STOPPED")
 
 
 async def _test_feishu() -> None:

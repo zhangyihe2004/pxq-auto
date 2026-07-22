@@ -11,8 +11,13 @@ from .db import Database
 
 MIN_INTERVAL = 10
 PREWARM_SECONDS = 60
-ON_SALE_STATUSES = {"ONSALE", "ON_SALE", "LACK_OF_TICKET"}
-TERMINAL_STATUSES = {"SALE_END", "ENDED", "CANCELLED", "CANCELED", "OFF_SHELF"}
+POST_SALE_WAIT_SECONDS = 60
+MISSING_SESSION_STATUS = "MISSING"
+OPEN_SESSION_STATUSES = {"ON_SALE", "PRE_SALE"}
+ACTIVE_SESSION_STATUSES = OPEN_SESSION_STATUSES | {
+    "LACK_OF_TICKET",
+    "PENDING",
+}
 
 
 class SessionUnavailable(RuntimeError):
@@ -36,19 +41,22 @@ def parse_numbers(value: str, upper: int) -> list[int]:
 
 
 def sale_phase(task, plans, now_ms: int | None = None) -> str:
-    """Return PRESALE, PREWARM, AVAILABLE, ONSALE or WAITING."""
-    sale_time_ms = task["sale_time_ms"]
-    if sale_time_ms is not None:
-        current_ms = int(time.time() * 1000) if now_ms is None else now_ms
-        remaining = (sale_time_ms - current_ms) / 1000
-        if remaining > 0:
-            return "PREWARM" if remaining <= PREWARM_SECONDS else "PRESALE"
-    if task["session_status"].upper() in ON_SALE_STATUSES:
+    """Return the internal phase derived from the official sessionStatus."""
+    status = str(task["session_status"] or "").upper()
+    if status in OPEN_SESSION_STATUSES:
         return (
             "AVAILABLE"
             if any(plan["sale_started"] and plan["can_buy_count"] > 0 for plan in plans)
-            else "ONSALE"
+            else "RESTOCK"
         )
+    if status == "LACK_OF_TICKET":
+        return "RESTOCK"
+    if status == "PENDING" and task["sale_time_ms"] is not None:
+        current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        remaining = (task["sale_time_ms"] - current_ms) / 1000
+        if remaining > PREWARM_SECONDS:
+            return "SCHEDULED"
+        return "PREWARM" if remaining >= -POST_SALE_WAIT_SECONDS else "RESTOCK"
     return "WAITING"
 
 
@@ -106,6 +114,9 @@ class TaskService:
             session_name=str(session.get("sessionName") or session_id),
             support_seat_picking=bool(session.get("supportSeatPicking")),
             interval_sec=max(MIN_INTERVAL, interval),
+            session_status=str(
+                session.get("sessionStatus") or MISSING_SESSION_STATUS
+            ).upper(),
             sale_time_ms=session.get("_sale_time_ms") or _sale_time(session),
             plans=plans,
         )
@@ -134,6 +145,14 @@ class TaskService:
             )
             if session is None:
                 raise SessionUnavailable("目标场次已从公开接口移除")
+            session_status = str(
+                session.get("sessionStatus") or MISSING_SESSION_STATUS
+            ).upper()
+            sale_time_ms = _sale_time(session)
+            if session_status == "PENDING" and sale_time_ms is None:
+                sale_time_ms = _session_sale_time(
+                    await self.client.show_dynamic(show_id), session_id
+                )
             plans = await plans_task
         finally:
             if not plans_task.done():
@@ -148,34 +167,35 @@ class TaskService:
             for item in plans["seatPlans"]
         ]
         return (
-            str(session.get("sessionStatus") or session.get("bizSessionStatus") or ""),
-            _sale_time(session),
+            session_status,
+            sale_time_ms,
             snapshot,
         )
 
 
 def _sale_time(value: Any) -> int | None:
-    candidates = [
+    candidates = {
         int(item)
         for item in _walk(value)
         if isinstance(item, (int, float)) and item > 1_000_000_000_000
-    ]
-    return min(candidates) if candidates else None
+    }
+    return candidates.pop() if len(candidates) == 1 else None
 
 
 def _session_sale_time(value: Any, session_id: str) -> int | None:
-    matches = [
-        item
-        for item in _walk_dicts(value)
-        if str(
-            item.get("bizShowSessionId")
-            or item.get("showSessionId")
-            or item.get("sessionId")
-            or ""
-        )
-        == session_id
-    ]
+    matches = [item for item in _walk_dicts(value) if _session_id(item) == session_id]
     return _sale_time(matches)
+
+
+def _find_session(value: Any, session_id: str) -> dict[str, Any] | None:
+    return next(
+        (item for item in _walk_dicts(value) if _session_id(item) == session_id),
+        None,
+    )
+
+
+def _session_id(value: dict[str, Any]) -> str:
+    return str(value.get("bizShowSessionId") or "")
 
 
 def _walk(value: Any):

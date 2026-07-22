@@ -40,7 +40,6 @@ class FeishuGateway:
         self,
         config: dict,
         command_queue: asyncio.Queue[IncomingCommand] | None = None,
-        http_client: httpx.AsyncClient | None = None,
     ):
         self.app_id = str(config.get("feishu_app_id") or "").strip()
         self.app_secret = str(config.get("feishu_app_secret") or "").strip()
@@ -55,8 +54,7 @@ class FeishuGateway:
             raise FeishuError("缺少 feishu_app_id 或 feishu_app_secret")
 
         self.command_queue = command_queue
-        self._http = http_client or httpx.AsyncClient(timeout=15)
-        self._owns_http = http_client is None
+        self._http = httpx.AsyncClient(timeout=15)
         self._token = ""
         self._token_expires_at = 0.0
         self._token_lock = asyncio.Lock()
@@ -115,8 +113,7 @@ class FeishuGateway:
         stopped = self._ws_stopped
         if stopped is not None and not stopped.done():
             stopped.set_result(None)
-        if self._owns_http:
-            await self._http.aclose()
+        await self._http.aclose()
 
     # ---- 应用身份与消息 API ----
 

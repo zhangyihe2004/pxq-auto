@@ -48,11 +48,27 @@ LOAD_ZONE_JS = (
     + FIND_VENUE_MAP_JS
     + ";"
     + """
+    const deadline = performance.now() + target.timeoutMs;
+    const frame = label => new Promise((resolve, reject) => {
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) return reject(new Error(label));
+        const timer = setTimeout(() => reject(new Error(label)), remaining);
+        requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
+    });
+    const bounded = (promise, label) => new Promise((resolve, reject) => {
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) return reject(new Error(label));
+        const timer = setTimeout(() => reject(new Error(label)), remaining);
+        Promise.resolve(promise).then(
+            value => { clearTimeout(timer); resolve(value); },
+            error => { clearTimeout(timer); reject(error); },
+        );
+    });
     let venueMap;
     do {
         venueMap = findVenueMap();
         if (venueMap?.venueBoxSelf?.mapbox?.isStyleLoaded?.() === true) break;
-        await new Promise(requestAnimationFrame);
+        await frame('等待票星球场馆对象超时');
     } while (true);
 
     const {enabledZoneCodes = []} =
@@ -64,7 +80,6 @@ LOAD_ZONE_JS = (
     const enabled = properties => properties.enable === true ||
         properties.enable === 'true' || properties.enable === 1 ||
         properties.enable === '1';
-    window.__pxqAutoMapbox = map;
     const view = {
         center: [target.x, target.y],
         zoom: Math.min(
@@ -79,9 +94,9 @@ LOAD_ZONE_JS = (
         );
     }
     venueMap.isRefreshing = true;
-    await new Promise((resolve, reject) => {
+    await bounded(new Promise((resolve, reject) => {
         Promise.resolve(box.loadSeatsInZoneCodes(enabledZoneCodes, resolve)).catch(reject);
-    });
+    }), '加载目标看台数据超时');
     const globals = document.getElementById('app')?._vnode?.appContext?.config
         ?.globalProperties;
     globals?.$loading?.().hide();
@@ -95,20 +110,14 @@ LOAD_ZONE_JS = (
             return enabled(properties) && properties.seatConcreteId === target.seatId &&
                 properties.seatPlanId === target.planId;
         })) break;
-        await new Promise(requestAnimationFrame);
+        await frame('等待目标座位数据超时');
     } while (true);
-    await new Promise(requestAnimationFrame);
+    await frame('等待目标座位绘制超时');
     const source = map.getSource('venueMapRowSeatDataSource');
     if (typeof source?.setData !== 'function') {
         throw new Error('未找到票星球座位数据源');
     }
     const seats = target.seats || [];
-    if (!seats.length) {
-        map.stop();
-        map.jumpTo(view);
-        source.setData({type: 'FeatureCollection', features: targetFeatures});
-        map.triggerRepaint();
-    }
     const selectedBefore = document.querySelectorAll('.seat-item').length;
     for (const [index, seat] of seats.entries()) {
         let point;
@@ -119,7 +128,7 @@ LOAD_ZONE_JS = (
                 source.setData({type: 'FeatureCollection', features: targetFeatures});
                 map.triggerRepaint();
             }
-            await new Promise(requestAnimationFrame);
+            await frame('等待目标座位渲染超时');
             point = map.project([seat.x, seat.y]);
             const feature = map.queryRenderedFeatures([point.x, point.y]).find(item => {
                 const properties = item.properties || {};
@@ -143,7 +152,7 @@ LOAD_ZONE_JS = (
         });
         while (document.querySelectorAll('.seat-item').length <
                selectedBefore + index + 1) {
-            await new Promise(requestAnimationFrame);
+            await frame('等待座位选中状态超时');
         }
     }
     return targetFeatures.length;
@@ -151,20 +160,27 @@ LOAD_ZONE_JS = (
 )
 
 RESET_SELECTION_JS = (
-    "async () => { const findVenueMap = "
+    "async timeoutMs => { const findVenueMap = "
     + FIND_VENUE_MAP_JS
     + ";"
     + """
+    const deadline = performance.now() + timeoutMs;
+    const frame = label => new Promise((resolve, reject) => {
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) return reject(new Error(label));
+        const timer = setTimeout(() => reject(new Error(label)), remaining);
+        requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
+    });
     let venueMap;
     do {
         venueMap = findVenueMap();
         if (venueMap?.venueBoxSelf?.mapbox?.isStyleLoaded?.() === true) break;
-        await new Promise(requestAnimationFrame);
+        await frame('等待票星球场馆对象超时');
     } while (true);
 
     venueMap.cancelAllSeat();
     do {
-        await new Promise(requestAnimationFrame);
+        await frame('等待清空选座状态超时');
         const confirm = [...document.querySelectorAll('button')].find(
             element => element.innerText?.trim() === '确认选座'
         );
@@ -194,7 +210,7 @@ async def select_seats(
         key=lambda candidate: candidate.seat.zone_id,
     ):
         candidates = tuple(grouped)
-        await _load_zone(site, candidates[0], candidates)
+        await _load_zone(site, candidates)
 
     confirm = await site._poll(lambda: site._enabled_exact("确认选座"))
     if confirm is None:
@@ -207,7 +223,10 @@ async def select_seats(
 async def _reset_selection(site: PiaoxingqiuPage) -> None:
     try:
         await asyncio.wait_for(
-            site.page.evaluate(RESET_SELECTION_JS),
+            site.page.evaluate(
+                RESET_SELECTION_JS,
+                max(250, site.config.browser.timeout_ms - 250),
+            ),
             timeout=site.config.browser.timeout_ms / 1000,
         )
     except TimeoutError as exc:
@@ -216,9 +235,9 @@ async def _reset_selection(site: PiaoxingqiuPage) -> None:
 
 async def _load_zone(
     site: PiaoxingqiuPage,
-    candidate: Candidate,
-    candidates: tuple[Candidate, ...] = (),
+    candidates: tuple[Candidate, ...],
 ) -> None:
+    candidate = candidates[0]
     try:
         count = await asyncio.wait_for(
             site.page.evaluate(
@@ -229,6 +248,7 @@ async def _load_zone(
                     "planId": candidate.plan_id,
                     "x": candidate.seat.x,
                     "y": candidate.seat.y,
+                    "timeoutMs": max(250, site.config.browser.timeout_ms - 250),
                     "seats": [_seat_target(item) for item in candidates],
                 },
             ),

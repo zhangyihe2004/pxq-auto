@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import time
 from dataclasses import dataclass
 
+from .api import PxqError
 from .auth import AuthGuard
 from .browser import persistent_browser
-from .config import SystemConfig, build_order_config
+from .config import AppConfig, SystemConfig, build_order_config
 from .db import Database
 from .feishu import FeishuGateway
+from .guard import PersistentOrderGuard
 from .runner import RunResult, check_login, run_account
 from .service import (
+    ACTIVE_SESSION_STATUSES,
     PREWARM_SECONDS,
-    TERMINAL_STATUSES,
     SessionUnavailable,
     TaskService,
     sale_phase,
@@ -25,8 +26,7 @@ log = logging.getLogger("pxq.auto")
 ERROR_ALERT_COOLDOWN = 3600.0
 MAX_BACKOFF_FACTOR = 16
 MAX_CONCURRENT_POLLS = 3
-PLAN_MISSING_THRESHOLD = 3
-SESSION_GONE_THRESHOLD = 3
+NOTICE_RETRY_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -35,8 +35,8 @@ class PendingNotice:
     title: str
     body: str
     template: str
+    required_task_status: str = "active"
     available_after: frozenset[str] | None = None
-    pause_task: bool = False
     error_alert: bool = False
 
 
@@ -58,10 +58,9 @@ class AutoEngine:
         self.next_poll: dict[int, float] = {}
         self.next_auth: dict[int, float] = {}
         self.failures: dict[int, int] = {}
-        self.session_gone: dict[int, int] = {}
-        self.plan_missing: dict[int, dict[str, int]] = {}
         self.last_error_alert: dict[int, float] = {}
         self.pending_notices: dict[int, dict[str, PendingNotice]] = {}
+        self.next_notice_retry = 0.0
         self.available_plans: dict[int, set[str]] = {}
         self.phases: dict[int, str] = {}
 
@@ -84,27 +83,25 @@ class AutoEngine:
         due = [
             task
             for task in tasks
-            if task["status"] == "active"
-            and now >= self.next_poll.get(task["id"], 0)
+            if task["status"] == "active" and now >= self.next_poll.get(task["id"], 0)
         ]
-        if not due:
-            return
+        if due:
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_POLLS)
+            session_tasks: dict[str, asyncio.Task[list[dict]]] = {}
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_POLLS)
-        session_tasks: dict[str, asyncio.Task[list[dict]]] = {}
+            async def poll_due(task) -> None:
+                async with semaphore:
+                    show_id = str(task["show_id"])
+                    sessions_task = session_tasks.get(show_id)
+                    if sessions_task is None:
+                        sessions_task = asyncio.create_task(
+                            self.service.client.quick_order_sessions(show_id)
+                        )
+                        session_tasks[show_id] = sessions_task
+                    await self._poll_safely(task, sessions_task)
 
-        async def poll_due(task) -> None:
-            async with semaphore:
-                show_id = str(task["show_id"])
-                sessions_task = session_tasks.get(show_id)
-                if sessions_task is None:
-                    sessions_task = asyncio.create_task(
-                        self.service.client.quick_order_sessions(show_id)
-                    )
-                    session_tasks[show_id] = sessions_task
-                await self._poll_safely(task, sessions_task)
-
-        await asyncio.gather(*(poll_due(task) for task in due))
+            await asyncio.gather(*(poll_due(task) for task in due))
+        await self._retry_notices()
 
     async def _poll_safely(
         self,
@@ -113,29 +110,32 @@ class AutoEngine:
     ) -> None:
         task_id = int(task["id"])
         try:
-            if not await self._retry_notices(task_id, include_pause=False):
-                return
             await self._poll(task, sessions_task)
-            self.session_gone.pop(task_id, None)
             if self.failures.get(task_id):
                 log.info("抢票任务 #%s 轮询恢复正常", task_id)
+                self.pending_notices.get(task_id, {}).pop("poll-error", None)
             self.failures[task_id] = 0
-        except SessionUnavailable as exc:
+        except SessionUnavailable:
             self.failures[task_id] = 0
-            await self._handle_session_gone(task, exc)
+            await self._pause_task(
+                task,
+                "session-gone",
+                "目标场次未出现在官方场次列表",
+            )
+        except PxqError as exc:
+            if exc.status_code == 22024033:
+                self.failures[task_id] = 0
+                await self._pause_task(
+                    task,
+                    "show-unavailable",
+                    f"票星球返回 22024033：{exc.comments or '节目暂不可售'}",
+                )
+            else:
+                self._handle_poll_error(task, exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            failures = self.failures.get(task_id, 0) + 1
-            self.failures[task_id] = failures
-            log.warning(
-                "抢票任务 #%s 轮询失败（连续 %s 次）：%s",
-                task_id,
-                failures,
-                exc,
-            )
-            if failures >= 5:
-                await self._alert_poll_error(task, failures, exc)
+            self._handle_poll_error(task, exc)
         finally:
             self._schedule_next(task_id)
 
@@ -155,12 +155,6 @@ class AutoEngine:
         status, sale_time_ms, snapshot = await self.service.refresh_task(
             task, sessions_task
         )
-        self._drop_notice(task_id, "session-gone")
-        if status.upper() not in TERMINAL_STATUSES:
-            self._drop_notice(task_id, "terminal")
-        if not await self._retry_notices(task_id):
-            return
-        snapshot = self._stabilize_snapshot(task_id, snapshot)
         if not self.db.update_task_snapshot(task_id, status, sale_time_ms, snapshot):
             return
         task = self.db.get_task(task_id)
@@ -169,19 +163,17 @@ class AutoEngine:
         now_ms = int(time.time() * 1000)
         remaining = (
             (task["sale_time_ms"] - now_ms) / 1000
-            if task["sale_time_ms"] is not None
+            if status == "PENDING" and task["sale_time_ms"] is not None
             else None
         )
-        if status.upper() in TERMINAL_STATUSES:
-            await self._send_notice(
-                task_id,
-                PendingNotice(
-                    "terminal",
-                    "抢票任务已暂停",
-                    f"任务 #{task_id}\n**{task['show_name']}**\n场次状态：{status}",
-                    "orange",
-                    pause_task=True,
-                ),
+        if status == "DELAY":
+            await self._pause_task(task, "session-delay", "目标场次延期（DELAY）")
+            return
+        if status not in ACTIVE_SESSION_STATUSES:
+            await self._pause_task(
+                task,
+                "unknown-status",
+                f"官方返回未知场次状态：{status}",
             )
             return
 
@@ -196,8 +188,7 @@ class AutoEngine:
                 "未知" if remaining is None else f"{remaining:.1f} 秒",
             )
             self.phases[task_id] = phase
-        await self._update_stock_notice(task, plans, phase)
-        presale = phase == "PREWARM"
+        prewarm = phase == "PREWARM"
         if self.system.create_order_enabled:
             for account in self.db.list_accounts(task_id):
                 account_plans = self.db.get_account_plans(account["id"])
@@ -208,65 +199,48 @@ class AutoEngine:
                 if (
                     account["enabled"]
                     and account["status"] == "READY"
-                    and (presale or (phase == "AVAILABLE" and available))
+                    and (prewarm or (phase == "AVAILABLE" and available))
                 ):
-                    self._start_account(account["id"], presale=presale)
+                    self._start_account(account["id"], prewarm=prewarm)
 
-        await self._schedule_login_checks(task, remaining)
+        self._update_stock_notice(task, plans, phase)
+        self._schedule_login_checks(task, remaining)
 
-    def _stabilize_snapshot(
-        self,
-        task_id: int,
-        snapshot: list[tuple[str, int, bool]],
-    ) -> list[tuple[str, int, bool]]:
-        current_ids = {plan_id for plan_id, _, _ in snapshot}
-        missing = self.plan_missing.setdefault(task_id, {})
-        for plan_id in current_ids:
-            missing.pop(plan_id, None)
-        for previous in self.db.get_task_plans(task_id):
-            plan_id = str(previous["seat_plan_id"])
-            if plan_id in current_ids:
-                continue
-            rounds = min(
-                missing.get(plan_id, 0) + 1,
-                PLAN_MISSING_THRESHOLD,
-            )
-            missing[plan_id] = rounds
-            snapshot.append(
-                (
-                    plan_id,
-                    int(previous["can_buy_count"])
-                    if rounds < PLAN_MISSING_THRESHOLD
-                    else 0,
-                    bool(previous["sale_started"]),
-                )
-            )
-        return snapshot
-
-    async def _handle_session_gone(self, task, exc: Exception) -> None:
+    async def _pause_task(self, task, key: str, reason: str) -> None:
         task_id = int(task["id"])
-        if not await self._retry_notices(task_id):
+        if not self.db.set_task_status(task_id, "paused", current_status="active"):
             return
-        rounds = self.session_gone.get(task_id, 0) + 1
-        self.session_gone[task_id] = rounds
-        log.info("抢票任务 #%s 场次连续缺失 %s 轮", task_id, rounds)
-        if rounds < SESSION_GONE_THRESHOLD:
-            return
-        await self._send_notice(
+        await self.cancel_task(task_id, reason=reason)
+        self._clear_runtime_state(task_id)
+        self._send_notice(
             task_id,
             PendingNotice(
-                "session-gone",
+                key,
                 "抢票任务已暂停",
                 (
                     f"任务 #{task_id}\n**{task['show_name']}**\n"
-                    f"场次已连续 {rounds} 次从接口消失：{exc}"
+                    f"场次：{task['session_name']}\n{reason}\n"
+                    f"核对后发送：恢复 {task_id}"
                 ),
                 "orange",
-                pause_task=True,
+                required_task_status="paused",
             ),
         )
 
-    async def _update_stock_notice(self, task, plans, phase: str) -> None:
+    def _handle_poll_error(self, task, exc: Exception) -> None:
+        task_id = int(task["id"])
+        failures = self.failures.get(task_id, 0) + 1
+        self.failures[task_id] = failures
+        log.warning(
+            "抢票任务 #%s 轮询失败（连续 %s 次）：%s",
+            task_id,
+            failures,
+            exc,
+        )
+        if failures >= 5:
+            self._alert_poll_error(task, failures, exc)
+
+    def _update_stock_notice(self, task, plans, phase: str) -> None:
         task_id = int(task["id"])
         current = self._available_plan_ids(task_id, plans, phase)
         added = current - self.available_plans[task_id]
@@ -274,7 +248,7 @@ class AutoEngine:
             self.available_plans[task_id] = current
             return
         available = [plan for plan in plans if str(plan["seat_plan_id"]) in added]
-        await self._send_notice(
+        self._send_notice(
             task_id,
             PendingNotice(
                 "stock",
@@ -310,7 +284,7 @@ class AutoEngine:
             and plan["can_buy_count"] > 0
         }
 
-    async def _alert_poll_error(
+    def _alert_poll_error(
         self,
         task,
         failures: int,
@@ -320,7 +294,7 @@ class AutoEngine:
         last = self.last_error_alert.get(task_id)
         if last is not None and time.monotonic() - last < ERROR_ALERT_COOLDOWN:
             return
-        await self._send_notice(
+        self._send_notice(
             task_id,
             PendingNotice(
                 "poll-error",
@@ -334,68 +308,54 @@ class AutoEngine:
             ),
         )
 
-    async def _send_notice(self, task_id: int, notice: PendingNotice) -> bool:
+    def _send_notice(self, task_id: int, notice: PendingNotice) -> None:
         pending = self.pending_notices.setdefault(task_id, {})
         if notice.key in pending:
-            return False
+            return
         pending[notice.key] = notice
-        if not await self.feishu.send_card(
-            notice.title,
-            notice.body,
-            notice.template,
-        ):
-            return False
-        pending.pop(notice.key, None)
-        await self._complete_notice(task_id, notice)
-        return True
 
-    async def _retry_notices(
-        self,
-        task_id: int,
-        *,
-        include_pause: bool = True,
-    ) -> bool:
-        task = self.db.get_task(task_id)
-        if not task or task["status"] != "active":
-            self._clear_runtime_state(task_id)
-            return False
-        for notice in list(self.pending_notices.get(task_id, {}).values()):
-            if notice.pause_task and not include_pause:
+    async def _retry_notices(self) -> None:
+        if not self.pending_notices or time.monotonic() < self.next_notice_retry:
+            return
+        failed = False
+        for task_id, pending in list(self.pending_notices.items()):
+            task = self.db.get_task(task_id)
+            if not task:
+                self.pending_notices.pop(task_id, None)
                 continue
-            if not await self.feishu.send_card(
-                notice.title,
-                notice.body,
-                notice.template,
-            ):
-                return True
-            self.pending_notices[task_id].pop(notice.key, None)
-            await self._complete_notice(task_id, notice)
-            if notice.pause_task:
-                return False
-        return True
+            for notice in list(pending.values()):
+                if task["status"] != notice.required_task_status:
+                    pending.pop(notice.key, None)
+                    continue
+                if not await self.feishu.send_card(
+                    notice.title,
+                    notice.body,
+                    notice.template,
+                ):
+                    failed = True
+                    continue
+                pending.pop(notice.key, None)
+                self._complete_notice(task_id, notice)
+            if not pending:
+                self.pending_notices.pop(task_id, None)
+        self.next_notice_retry = (
+            time.monotonic() + NOTICE_RETRY_SECONDS if failed else 0.0
+        )
 
-    async def _complete_notice(self, task_id: int, notice: PendingNotice) -> None:
+    def _complete_notice(self, task_id: int, notice: PendingNotice) -> None:
         if notice.available_after is not None:
             self.available_plans[task_id] = set(notice.available_after)
         if notice.error_alert:
             self.last_error_alert[task_id] = time.monotonic()
-        if notice.pause_task and self.db.set_task_status(task_id, "paused"):
-            await self.cancel_task(task_id)
-            self._clear_runtime_state(task_id)
-
-    def _drop_notice(self, task_id: int, key: str) -> None:
-        notices = self.pending_notices.get(task_id)
-        if notices:
-            notices.pop(key, None)
 
     def _schedule_next(self, task_id: int) -> None:
         task = self.db.get_task(task_id)
         if not task or task["status"] != "active":
             self._clear_runtime_state(task_id)
             return
-        delay = task["interval_sec"] * random.uniform(0.9, 1.2)
+        delay = float(task["interval_sec"])
         delay *= min(2 ** self.failures.get(task_id, 0), MAX_BACKOFF_FACTOR)
-        if task["sale_time_ms"] is not None:
+        if task["session_status"] == "PENDING" and task["sale_time_ms"] is not None:
             remaining = (task["sale_time_ms"] - int(time.time() * 1000)) / 1000
             if remaining > PREWARM_SECONDS:
                 delay = min(delay, max(1.0, remaining - PREWARM_SECONDS))
@@ -405,10 +365,7 @@ class AutoEngine:
         for mapping in (
             self.next_poll,
             self.failures,
-            self.session_gone,
             self.last_error_alert,
-            self.plan_missing,
-            self.pending_notices,
             self.available_plans,
             self.phases,
         ):
@@ -419,26 +376,23 @@ class AutoEngine:
         for mapping in (
             self.next_poll,
             self.failures,
-            self.session_gone,
             self.last_error_alert,
-            self.plan_missing,
-            self.pending_notices,
             self.available_plans,
             self.phases,
         ):
             mapping.pop(task_id, None)
 
-    def _start_account(self, account_id: int, *, presale: bool) -> None:
+    def _start_account(self, account_id: int, *, prewarm: bool) -> None:
         if account_id in self.jobs:
             log.debug("账号 #%s 已有执行任务，忽略重复启动", account_id)
             return
         account = self.db.get_account(account_id)
         task_id = int(account["task_id"]) if account else None
-        mode = "预售预热" if presale else "回流抢票"
+        mode = "开售预热" if prewarm else "回流抢票"
         log.info("任务 #%s 账号 #%s 已加入执行队列（%s）", task_id, account_id, mode)
         job = asyncio.create_task(
-            self._run_after_check(account_id, presale, self.checks.get(account_id)),
-            name=f"pxq-account-{account_id}-{'presale' if presale else 'available'}",
+            self._run_after_check(account_id, prewarm, self.checks.get(account_id)),
+            name=f"pxq-account-{account_id}-{'prewarm' if prewarm else 'available'}",
         )
         self.jobs[account_id] = job
 
@@ -477,21 +431,21 @@ class AutoEngine:
     async def _run_after_check(
         self,
         account_id: int,
-        presale: bool,
+        prewarm: bool,
         check: asyncio.Task | None,
     ) -> str:
         if check:
             log.info("账号 #%s 启动抢票前取消正在进行的登录检查", account_id)
             check.cancel()
             await asyncio.gather(check, return_exceptions=True)
-        return await self._run_account(account_id, presale)
+        return await self._run_account(account_id, prewarm)
 
-    async def _run_account(self, account_id: int, presale: bool) -> str:
+    async def _run_account(self, account_id: int, prewarm: bool) -> str:
         async with self.semaphore:
             log.info(
                 "账号 #%s 获得执行权（%s）",
                 account_id,
-                "预售预热" if presale else "回流抢票",
+                "开售预热" if prewarm else "回流抢票",
             )
             account = self.db.get_account(account_id)
             if not account:
@@ -506,33 +460,59 @@ class AutoEngine:
             if task["status"] != "active":
                 return f"任务状态为 {task['status']}"
             plans = self.db.get_account_plans(account_id)
+            if prewarm:
+                phase = sale_phase(task, plans)
+                if phase == "AVAILABLE":
+                    prewarm = False
+                elif phase != "PREWARM":
+                    return f"预热阶段已结束（{phase}）"
             people = self.db.get_audiences(account_id)
             config = build_order_config(task, plans, people, account, self.system)
             if not self.db.claim_account(account_id):
                 return "账号状态竞争失败"
             try:
                 async with persistent_browser(config.browser) as context:
-                    result = await run_account(config, context, presale=presale)
+                    result = await run_account(config, context, prewarm=prewarm)
             except asyncio.CancelledError:
                 current = self.db.get_account(account_id)
                 if current:
-                    self.db.set_account_status(
-                        account_id, "READY" if current["enabled"] else "STOPPED"
-                    )
+                    protected = _protected_order_state(config)
+                    if protected:
+                        self.db.set_account_status(
+                            account_id,
+                            protected[0],
+                            order_id=protected[1],
+                            error="执行中断，请人工核对待支付订单",
+                        )
+                    else:
+                        self.db.set_account_status(
+                            account_id,
+                            "READY" if current["enabled"] else "STOPPED",
+                        )
                 raise
             except Exception as exc:
                 log.exception("账号 #%s 抢票执行失败", account_id)
                 current = self.db.get_account(account_id)
+                result = RunResult("FAILED", str(exc))
                 if current:
-                    self.db.set_account_status(
-                        account_id,
-                        "READY" if current["enabled"] else "STOPPED",
-                        error=str(exc),
-                    )
-                await self._notify_result(
-                    account_id, task, RunResult("FAILED", str(exc))
-                )
-                return "执行异常"
+                    protected = _protected_order_state(config)
+                    if protected:
+                        status, order_id = protected
+                        self.db.set_account_status(
+                            account_id,
+                            status,
+                            order_id=order_id,
+                            error=str(exc),
+                        )
+                        result = RunResult(status, str(exc), order_id=order_id)
+                    else:
+                        self.db.set_account_status(
+                            account_id,
+                            "READY" if current["enabled"] else "STOPPED",
+                            error=str(exc),
+                        )
+                self._notify_result(account_id, task, result)
+                return result.status
             self._apply_removed_audiences(account_id, result.removed_audiences)
             current = self.db.get_account(account_id)
             if current is None:
@@ -551,11 +531,11 @@ class AutoEngine:
                 if result.status in {"CREATED", "COMPLETE"}
                 else result.message,
             )
-            if result.status not in {"NO_STOCK"}:
-                await self._notify_result(account_id, task, result)
+            if result.status != "RESTOCK":
+                self._notify_result(account_id, task, result)
             return result.status
 
-    async def _schedule_login_checks(self, task, remaining: float | None) -> None:
+    def _schedule_login_checks(self, task, remaining: float | None) -> None:
         interval = AuthGuard.interval(
             remaining if remaining is not None else float("inf")
         )
@@ -605,7 +585,7 @@ class AutoEngine:
                 self.db.set_account_status(
                     account_id, "NEEDS_LOGIN", error="登录已失效"
                 )
-                await self._send_notice(
+                self._send_notice(
                     int(task["id"]),
                     PendingNotice(
                         f"login:{account_id}",
@@ -618,16 +598,9 @@ class AutoEngine:
     def _apply_removed_audiences(
         self, account_id: int, removed: tuple[str, ...]
     ) -> None:
-        if not removed:
-            return
-        people = [
-            (person["name"], person["masked_id"])
-            for person in self.db.get_audiences(account_id)
-            if person["masked_id"] not in removed
-        ]
-        self.db.replace_audiences(account_id, people)
+        self.db.remove_audiences(account_id, removed)
 
-    async def _notify_result(self, account_id: int, task, result: RunResult) -> None:
+    def _notify_result(self, account_id: int, task, result: RunResult) -> None:
         title = {
             "CREATED": "订单已创建",
             "UNKNOWN": "订单结果未知",
@@ -641,8 +614,7 @@ class AutoEngine:
                 f"如已取消并需继续，发送：重置 {account_id}"
             ),
             "UNKNOWN": (
-                "下一步：检查票星球待支付订单；"
-                f"确认无订单后发送：重置 {account_id}"
+                f"下一步：检查票星球待支付订单；确认无订单后发送：重置 {account_id}"
             ),
             "NEEDS_LOGIN": f"下一步：登录 {task['id']}",
             "COMPLETE": f"下一步：配置 {account_id}",
@@ -651,7 +623,7 @@ class AutoEngine:
             f"任务 #{task['id']}｜账号 #{account_id}\n"
             f"**{task['show_name']}**\n{result.message}\n{action}\n操作：未支付"
         )
-        await self._send_notice(
+        self._send_notice(
             int(task["id"]),
             PendingNotice(
                 f"result:{account_id}:{result.status}",
@@ -667,6 +639,15 @@ class AutoEngine:
         *,
         reason: str = "账号操作",
     ) -> None:
+        account = self.db.get_account(account_id)
+        if account:
+            pending = self.pending_notices.get(int(account["task_id"]))
+            if pending:
+                for key in tuple(pending):
+                    if key == f"login:{account_id}" or key.startswith(
+                        f"result:{account_id}:"
+                    ):
+                        pending.pop(key, None)
         self.next_auth.pop(account_id, None)
         activities = [
             activity
@@ -681,6 +662,7 @@ class AutoEngine:
             await asyncio.gather(*activities, return_exceptions=True)
 
     async def cancel_task(self, task_id: int, *, reason: str = "任务操作") -> None:
+        self.pending_notices.pop(task_id, None)
         await asyncio.gather(
             *(
                 self.cancel_account(
@@ -697,3 +679,15 @@ class AutoEngine:
             activity.cancel()
         if activities:
             await asyncio.gather(*activities, return_exceptions=True)
+
+
+def _protected_order_state(config: AppConfig) -> tuple[str, str | None] | None:
+    try:
+        state = PersistentOrderGuard(config.state_path, config.plan_key).current()
+    except RuntimeError:
+        return "UNKNOWN", None
+    if state.status == "SUBMITTING":
+        return "UNKNOWN", state.order_id
+    if state.status in {"CREATED", "UNKNOWN"}:
+        return state.status, state.order_id
+    return None
