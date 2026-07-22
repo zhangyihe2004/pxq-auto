@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.async_api import Locator, Page, Request, Response
 
 from .config import AppConfig, AudienceConfig
-from .guard import CREATE_PATH
+from .guard import is_create_url
 
 if TYPE_CHECKING:
     from .inventory import GeneralAdmissionSelection, SeatSelection
@@ -402,8 +402,7 @@ class CreateResponseWatcher:
     def handle(self, response: Response) -> None:
         if response.request.method.upper() != "POST":
             return
-        response_url = response.url.lower()
-        if CREATE_PATH not in response_url:
+        if not is_create_url(response.url):
             return
         self._responses.put_nowait(response)
 

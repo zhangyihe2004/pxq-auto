@@ -6,12 +6,22 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from playwright.async_api import Request, Route
 
 
 GuardStatus = Literal["READY", "SUBMITTING", "CREATED", "UNKNOWN"]
-CREATE_PATH = "/trade/buyer/v1/items/orders/submit"
+CREATE_PATHS = frozenset(
+    {
+        "/cyy_gatewayapi/trade/buyer/v1/items/orders/submit",
+        "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order",
+    }
+)
+
+
+def is_create_url(url: str) -> bool:
+    return urlsplit(url).path.lower() in CREATE_PATHS
 
 
 @dataclass
@@ -118,9 +128,7 @@ class OrderFirewall:
             await route.continue_()
             return
 
-        request_url = request.url.lower()
-        is_create = CREATE_PATH in request_url
-        if is_create:
+        if is_create_url(request.url):
             if self.armed and not self.attempt_allowed:
                 self.attempt_allowed = True
                 await route.continue_()
