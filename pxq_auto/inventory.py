@@ -7,7 +7,7 @@ import math
 import re
 import secrets
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 from urllib.parse import urlencode
 
@@ -44,17 +44,7 @@ class Seat:
     seat_no: int
     x: float
     y: float
-
-
-@dataclass(frozen=True)
-class ZoneGeometry:
-    center: tuple[float, float]
-
-
-@dataclass(frozen=True)
-class VenueGeometry:
-    center: tuple[float, float]
-    zones: dict[str, ZoneGeometry]
+    row_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -63,7 +53,6 @@ class Candidate:
     plan: str
     plan_id: str
     plan_rank: int
-    row_index: int
 
 
 @dataclass(frozen=True)
@@ -225,16 +214,6 @@ class InventoryBootstrap:
             and item.get("zoneConcreteId")
             and item.get("url")
         }
-        venue_url = next(
-            (
-                str(item["url"])
-                for item in static_data.get("staticResList", [])
-                if isinstance(item, dict)
-                and item.get("dataType") == "VENUE_DATA"
-                and item.get("url")
-            ),
-            None,
-        )
         if not resources:
             raise StaticInventoryUnavailable("静态座位资源尚未下发")
         return Inventory(
@@ -245,8 +224,6 @@ class InventoryBootstrap:
             plan_names=self.plan_names,
             plan_ids=self.plan_ids,
             resources=resources,
-            venue_url=venue_url,
-            venue=None,
             zones={},
         )
 
@@ -263,8 +240,6 @@ class Inventory:
     plan_names: tuple[str, ...]
     plan_ids: tuple[str, ...]
     resources: dict[str, str]
-    venue_url: str | None
-    venue: VenueGeometry | None
     zones: dict[str, tuple[Seat, ...]]
 
     @classmethod
@@ -318,7 +293,6 @@ class Inventory:
                 rank,
                 plan_name,
                 plan_id,
-                self.zones[zone_id],
                 tuple(
                     seat
                     for seat in self.zones[zone_id]
@@ -328,25 +302,14 @@ class Inventory:
             for (rank, plan_name, plan_id), bitsets in inventories.items()
             for zone_id, bits in bitsets.items()
         ]
-        mapped_count = sum(len(item[4]) for item in available_zones)
+        mapped_count = sum(len(item[3]) for item in available_zones)
         if not mapped_count:
             raise RuntimeError("动态库存存在，但未能映射到静态座位")
         selected_quantity = min(quantity, mapped_count)
-        if selected_quantity > 1 and self.venue is None:
-            if self.venue_url is None:
-                raise RuntimeError("多人选座缺少全场几何资源")
-            self.venue = await _decode_venue_geometry(self.site, self.venue_url)
         available = tuple(
-            candidate
-            for rank, plan_name, plan_id, seats, live_seats in available_zones
-            for candidate in _rank_zone(
-                seats,
-                live_seats,
-                self.venue,
-                plan_name,
-                plan_id,
-                rank,
-            )
+            Candidate(seat, plan_name, plan_id, rank)
+            for rank, plan_name, plan_id, live_seats in available_zones
+            for seat in live_seats
         )
         selected = next(
             (
@@ -485,81 +448,12 @@ async def _decode_zones(
         if not response.ok:
             raise RuntimeError(f"看台布局接口返回 HTTP {response.status}")
         features = geobuf.decode(await response.body()).get("features", [])
-        seats = tuple(filter(None, (_seat(feature, zone_id) for feature in features)))
+        seats = _index_rows(
+            tuple(filter(None, (_seat(feature, zone_id) for feature in features)))
+        )
         return zone_id, seats
 
     return dict(await asyncio.gather(*(decode(zone_id) for zone_id in zone_ids)))
-
-
-async def _decode_venue_geometry(
-    site: PiaoxingqiuPage,
-    venue_url: str,
-) -> VenueGeometry:
-    response = await site.page.context.request.get(venue_url)
-    if not response.ok:
-        raise RuntimeError(f"全场几何接口返回 HTTP {response.status}")
-    features = geobuf.decode(await response.body()).get("features", [])
-    zones: dict[str, ZoneGeometry] = {}
-    centers: list[tuple[float, float]] = []
-    for feature in features:
-        properties = feature.get("properties", {}) if isinstance(feature, dict) else {}
-        geometry = feature.get("geometry", {}) if isinstance(feature, dict) else {}
-        if properties.get("level") != "zone" or geometry.get("type") != "Polygon":
-            continue
-        coordinates = geometry.get("coordinates", [])
-        if coordinates and isinstance(coordinates[0], list):
-            points = _points(coordinates[0])
-            center = _polygon_centroid(points)
-            if center is None:
-                continue
-            zone = ZoneGeometry(center=center)
-            centers.append(center)
-            for key in ("zoneConcreteId", "id", "code", "text", "standText"):
-                if value := str(properties.get(key) or ""):
-                    zones[value] = zone
-    if not centers or not zones:
-        raise RuntimeError("全场几何资源中没有可用的看台多边形")
-    center = (
-        sum(point[0] for point in centers) / len(centers),
-        sum(point[1] for point in centers) / len(centers),
-    )
-    return VenueGeometry(center=center, zones=zones)
-
-
-def _points(ring: list[Any]) -> tuple[tuple[float, float], ...]:
-    return tuple(
-        (float(point[0]), float(point[1]))
-        for point in ring
-        if isinstance(point, list)
-        and len(point) >= 2
-        and isinstance(point[0], (int, float))
-        and isinstance(point[1], (int, float))
-    )
-
-
-def _polygon_centroid(
-    points: tuple[tuple[float, float], ...],
-) -> tuple[float, float] | None:
-    if len(points) < 3:
-        return None
-    area = sum(
-        left[0] * right[1] - right[0] * left[1]
-        for left, right in zip(points, points[1:] + points[:1])
-    )
-    if abs(area) < 1e-15:
-        return (
-            sum(point[0] for point in points) / len(points),
-            sum(point[1] for point in points) / len(points),
-        )
-    x = sum(
-        (left[0] + right[0]) * (left[0] * right[1] - right[0] * left[1])
-        for left, right in zip(points, points[1:] + points[:1])
-    )
-    y = sum(
-        (left[1] + right[1]) * (left[0] * right[1] - right[0] * left[1])
-        for left, right in zip(points, points[1:] + points[:1])
-    )
-    return x / (3 * area), y / (3 * area)
 
 
 def _seat(feature: Any, zone_id: str) -> Seat | None:
@@ -582,7 +476,7 @@ def _seat(feature: Any, zone_id: str) -> Seat | None:
             zone_id=zone_id,
             zone_name=str(properties.get("zoneName") or zone_id),
             seat_id=seat_id,
-            row=str(properties.get("row") or ""),
+            row=_row_name(properties),
             seat_no=int(properties["seatNo"]),
             x=float(coordinates[0]),
             y=float(coordinates[1]),
@@ -591,53 +485,39 @@ def _seat(feature: Any, zone_id: str) -> Seat | None:
         return None
 
 
-def _bit_is_set(bits: bytes, seat_no: int) -> bool:
-    byte_index, bit_index = divmod(seat_no, 8)
-    return byte_index < len(bits) and bool(bits[byte_index] & (128 >> bit_index))
+def _row_name(properties: dict[str, Any]) -> str:
+    prefix, separator, _ = str(properties.get("seatName") or "").rpartition("排")
+    return prefix + separator if separator else str(properties.get("row") or "")
 
 
-def _rank_zone(
-    seats: tuple[Seat, ...],
-    available: tuple[Seat, ...],
-    venue: VenueGeometry | None,
-    plan: str,
-    plan_id: str,
-    plan_rank: int,
-) -> tuple[Candidate, ...]:
-    if not seats or not available:
-        return ()
-    if venue is None:
-        return tuple(
-            Candidate(seat, plan, plan_id, plan_rank, seat.seat_no)
-            for seat in available
-        )
-    zone = _zone_geometry(venue, seats[0])
-    radial_x = zone.center[0] - venue.center[0]
-    radial_y = zone.center[1] - venue.center[1]
-    length = math.hypot(radial_x, radial_y)
-    if length == 0:
-        raise RuntimeError(f"看台“{seats[0].zone_name}”缺少有效的场馆相对位置")
-    tangent = (-radial_y / length, radial_x / length)
+def _index_rows(seats: tuple[Seat, ...]) -> tuple[Seat, ...]:
     rows: dict[str, list[Seat]] = {}
     for seat in seats:
         rows.setdefault(seat.row, []).append(seat)
-    row_indexes: dict[str, int] = {}
-    for row_seats in rows.values():
+    indexes: dict[str, int] = {}
+    for row in rows.values():
+        axis = _principal_axis(row)
         ordered = sorted(
-            row_seats,
-            key=lambda seat: _dot((seat.x, seat.y), tangent),
+            row,
+            key=lambda seat: (seat.x * axis[0] + seat.y * axis[1], seat.seat_id),
         )
-        row_indexes.update({seat.seat_id: index for index, seat in enumerate(ordered)})
-    return tuple(
-        Candidate(
-            seat=seat,
-            plan=plan,
-            plan_id=plan_id,
-            plan_rank=plan_rank,
-            row_index=row_indexes[seat.seat_id],
-        )
-        for seat in available
-    )
+        indexes.update({seat.seat_id: index for index, seat in enumerate(ordered)})
+    return tuple(replace(seat, row_index=indexes[seat.seat_id]) for seat in seats)
+
+
+def _principal_axis(seats: list[Seat]) -> tuple[float, float]:
+    center_x = sum(seat.x for seat in seats) / len(seats)
+    center_y = sum(seat.y for seat in seats) / len(seats)
+    xx = sum((seat.x - center_x) ** 2 for seat in seats)
+    yy = sum((seat.y - center_y) ** 2 for seat in seats)
+    xy = sum((seat.x - center_x) * (seat.y - center_y) for seat in seats)
+    angle = math.atan2(2 * xy, xx - yy) / 2
+    return math.cos(angle), math.sin(angle)
+
+
+def _bit_is_set(bits: bytes, seat_no: int) -> bool:
+    byte_index, bit_index = divmod(seat_no, 8)
+    return byte_index < len(bits) and bool(bits[byte_index] & (128 >> bit_index))
 
 
 def _select_group(
@@ -673,10 +553,10 @@ def _continuous_groups(
         )
     groups: list[SeatGroup] = []
     for row in rows.values():
-        ordered = sorted(row, key=lambda candidate: candidate.row_index)
+        ordered = sorted(row, key=lambda candidate: candidate.seat.row_index)
         run: list[Candidate] = []
         for candidate in ordered:
-            if run and candidate.row_index != run[-1].row_index + 1:
+            if run and candidate.seat.row_index != run[-1].seat.row_index + 1:
                 _append_windows(groups, run, quantity)
                 run = []
             run.append(candidate)
@@ -724,17 +604,6 @@ def _random_best(groups: list[SeatGroup]) -> SeatGroup:
 
 def _distance(left: Seat, right: Seat) -> float:
     return math.hypot(left.x - right.x, left.y - right.y)
-
-
-def _zone_geometry(venue: VenueGeometry, seat: Seat) -> ZoneGeometry:
-    zone = venue.zones.get(seat.zone_id) or venue.zones.get(seat.zone_name)
-    if zone is None:
-        raise RuntimeError(f"全场几何资源缺少看台“{seat.zone_name}”")
-    return zone
-
-
-def _dot(left: tuple[float, float], right: tuple[float, float]) -> float:
-    return left[0] * right[0] + left[1] * right[1]
 
 
 def _url(endpoint: str, query: dict[str, str]) -> str:
