@@ -4,7 +4,7 @@ import asyncio
 import shlex
 import time
 
-from .config import build_order_config, mask_phone, remove_account_home
+from .config import account_home, mask_phone, remove_account_home
 from .configuration import AccountConfigurator
 from .db import Database
 from .engine import AutoEngine
@@ -60,6 +60,7 @@ class CommandWorker:
         self.login = login
         self.feishu = feishu
         self.pending_replies: dict[str, str] = {}
+        login.reply = self._reply
         self.configurator = AccountConfigurator(
             db,
             engine.cancel_account,
@@ -85,10 +86,8 @@ class CommandWorker:
             await asyncio.gather(maintenance, return_exceptions=True)
 
     async def _reply(self, message_id: str, text: str) -> None:
-        if self.pending_replies:
-            self._queue_reply(message_id, text)
-            return
         if await self.feishu.reply_text(message_id, text):
+            self.pending_replies.pop(message_id, None)
             return
         self._queue_reply(message_id, text)
 
@@ -101,13 +100,16 @@ class CommandWorker:
         while True:
             await asyncio.sleep(REPLY_RETRY_SECONDS)
             await self.configurator.expire()
+            cutoff = time.monotonic() - SEARCH_TTL
+            self.searches = {
+                key: value for key, value in self.searches.items() if value[0] > cutoff
+            }
             await self._retry_replies()
 
     async def _retry_replies(self) -> None:
         for message_id, text in list(self.pending_replies.items()):
-            if not await self.feishu.reply_text(message_id, text):
-                break
-            self.pending_replies.pop(message_id, None)
+            if await self.feishu.reply_text(message_id, text):
+                self.pending_replies.pop(message_id, None)
 
     async def execute(self, command: IncomingCommand) -> str:
         response = await self.login.consume(command)
@@ -138,7 +140,7 @@ class CommandWorker:
         if name == "间隔":
             return self._interval(parts)
         if name == "登录":
-            return await self._login(command, parts)
+            return self._login(command, parts)
         if name == "配置":
             return await self._configure(command, parts)
         if name == "启动":
@@ -148,7 +150,7 @@ class CommandWorker:
         if name == "解绑":
             return await self._detach(parts)
         if name == "重置":
-            return self._reset(parts)
+            return await self._reset(parts)
         return f"无法识别指令：{name}\n发送：帮助"
 
     @staticmethod
@@ -290,7 +292,7 @@ class CommandWorker:
             f"演出：{task['show_name']}",
             f"场次：{task['session_name']}",
             f"方式：{'选座' if task['support_seat_picking'] else '不选座'}",
-            f"状态：{_mode(task, plans)}",
+            f"状态：{_mode(task, phase)}",
             f"间隔：{task['interval_sec']} 秒",
             "",
             f"票档目录（{len(plans)}）：",
@@ -298,7 +300,7 @@ class CommandWorker:
         for number, plan in enumerate(plans, 1):
             stock = (
                 "未开售"
-                if phase in {"PRESALE", "PREWARM", "WAITING"}
+                if phase in {"SCHEDULED", "PREWARM", "WAITING"}
                 else f"有票 {plan['can_buy_count']} 张"
                 if plan["sale_started"] and plan["can_buy_count"] > 0
                 else "可售但无票"
@@ -375,10 +377,10 @@ class CommandWorker:
         adjusted = "（已按最低值调整）" if requested < MIN_INTERVAL else ""
         return f"任务 #{task_id} 间隔已改为 {interval} 秒{adjusted}。"
 
-    async def _login(self, command: IncomingCommand, parts: list[str]) -> str:
+    def _login(self, command: IncomingCommand, parts: list[str]) -> str:
         if len(parts) != 2 or not parts[1].isdigit():
             return "发送：登录 <任务ID>"
-        return await self.login.start(command, int(parts[1]))
+        return self.login.start(command, int(parts[1]))
 
     async def _configure(self, command: IncomingCommand, parts: list[str]) -> str:
         if len(parts) != 2 or not parts[1].isdigit():
@@ -449,25 +451,23 @@ class CommandWorker:
         remove_account_home(key)
         return f"账号 #{account_id} 已解绑，全部本地资料和手机号占用均已删除。"
 
-    def _reset(self, parts: list[str]) -> str:
+    async def _reset(self, parts: list[str]) -> str:
         if len(parts) != 2 or not parts[1].isdigit():
             return "发送：重置 <账号ID>"
         account_id = int(parts[1])
         account = self.db.get_account(account_id)
         if not account:
             return f"账号 #{account_id} 不存在。"
-        task = self.db.get_task(account["task_id"])
-        plans = self.db.get_account_plans(account_id)
+        self.configurator.cancel_account_session(account_id)
+        await self.engine.cancel_account(account_id, reason="重置订单保护")
+        account = self.db.get_account(account_id)
+        if not account:
+            return f"账号 #{account_id} 已不存在。"
+        PersistentOrderGuard.clear(
+            account_home(account["profile_key"]) / "order-state.json"
+        )
+        self.db.set_account_status(account_id, "STOPPED", order_id=None)
         people = self.db.get_audiences(account_id)
-        if not task or not plans:
-            return f"账号配置不完整。发送：配置 {account_id}"
-        if people:
-            config = build_order_config(
-                task, plans, people, account, self.engine.system
-            )
-            PersistentOrderGuard(config.state_path, config.plan_key).ready()
-        self.db.set_account_status(account_id, "STOPPED")
-        self.db.deactivate_account(account_id)
         next_action = (
             f"启动 {account_id}"
             if people
@@ -479,13 +479,13 @@ class CommandWorker:
         )
 
 
-def _mode(task, plans) -> str:
+def _mode(task, phase: str) -> str:
     if task["status"] != "active":
         return "已暂停"
     return {
-        "PRESALE": "等待开售",
+        "SCHEDULED": "等待开售",
         "PREWARM": "预抢票准备",
         "AVAILABLE": "当前有票",
-        "ONSALE": "等待回流",
+        "RESTOCK": "等待回流",
         "WAITING": "等待开售",
-    }[sale_phase(task, plans)]
+    }[phase]

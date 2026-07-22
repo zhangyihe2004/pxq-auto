@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.async_api import Locator, Page, Request, Response
 
 from .config import AppConfig, AudienceConfig
-from .guard import CREATE_MARKERS
+from .guard import CREATE_PATH
 
 if TYPE_CHECKING:
     from .inventory import GeneralAdmissionSelection, SeatSelection
@@ -24,10 +24,7 @@ T = TypeVar("T")
 
 
 def is_success_payload(payload: object) -> TypeGuard[dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return False
-    status = payload.get("statusCode")
-    return status is None or str(status) == "200"
+    return isinstance(payload, dict) and str(payload.get("statusCode")) == "200"
 
 
 class PiaoxingqiuPage:
@@ -74,14 +71,6 @@ class PiaoxingqiuPage:
 
     async def _goto(self, url: str) -> None:
         await self.page.goto(url, wait_until="domcontentloaded")
-
-        async def body_ready() -> bool | None:
-            ready = await self.page.evaluate(
-                "() => Boolean(document.body && document.body.innerText.trim())"
-            )
-            return True if ready else None
-
-        await self._poll(body_ready)
 
     async def prepare_order(
         self,
@@ -217,14 +206,6 @@ class PiaoxingqiuPage:
 
         if await self._poll(audience_selected) is None:
             raise RuntimeError("订单页实际选中的观演人与配置不完全一致")
-
-    async def find_created_order_id(self) -> str | None:
-        async def find() -> str | None:
-            body = await self.page.locator("body").inner_text()
-            matched = re.search(r"订单编号\s*[:：]\s*([A-Za-z0-9-]+)", body)
-            return matched.group(1) if matched else None
-
-        return await self._poll(find)
 
     async def _open_seat_map(self, plan_id: str, plan_name: str) -> None:
         session = await self._poll(
@@ -418,11 +399,11 @@ class CreateResponseWatcher:
     def __init__(self) -> None:
         self._responses: asyncio.Queue[Response] = asyncio.Queue()
 
-    async def handle(self, response: Response) -> None:
+    def handle(self, response: Response) -> None:
         if response.request.method.upper() != "POST":
             return
         response_url = response.url.lower()
-        if not any(marker in response_url for marker in CREATE_MARKERS):
+        if CREATE_PATH not in response_url:
             return
         self._responses.put_nowait(response)
 

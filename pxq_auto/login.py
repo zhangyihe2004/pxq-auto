@@ -69,9 +69,10 @@ class FeishuLoginManager:
         self.feishu = feishu
         self.system = system
         self.cancel_account_worker = cancel_account
+        self.reply: Callable[[str, str], Awaitable[object]] = feishu.reply_text
         self.sessions: dict[str, LoginSession] = {}
 
-    async def start(self, command: IncomingCommand, task_id: int) -> str:
+    def start(self, command: IncomingCommand, task_id: int) -> str:
         if not self.db.get_task(task_id):
             return f"抢票任务 #{task_id} 不存在。"
         if command.sender_open_id in self.sessions:
@@ -154,7 +155,7 @@ class FeishuLoginManager:
                         if session.release_on_failure
                         else f"账号资料已保留；可再次发送：登录 {session.task_id}"
                     )
-                    await self.feishu.reply_text(
+                    await self.reply(
                         session.last_message_id,
                         f"登录流程 5 分钟未操作，已取消。{detail}",
                     )
@@ -283,14 +284,12 @@ class FeishuLoginManager:
             )
             session.phase = "SMS"
             return (
-                "图形验证码已通过，短信验证码已发送，请直接回复短信验证码。\n"
-                "退出：取消"
+                "图形验证码已通过，短信验证码已发送，请直接回复短信验证码。\n退出：取消"
             )
         if result.code in IMAGE_CODE_REQUIRED:
             await self._send_captcha(session, command.message_id)
             return (
-                f"图形验证码未通过：{result.message}\n"
-                "已刷新图片，请重试。\n退出：取消"
+                f"图形验证码未通过：{result.message}\n已刷新图片，请重试。\n退出：取消"
             )
         raise RuntimeError(_api_error("图形验证码校验失败", result))
 
@@ -351,32 +350,23 @@ class FeishuLoginManager:
 
 
 async def _wait_unique(locator: Locator, label: str) -> Locator:
-    visible: list[Locator] = []
     for _ in range(40):
-        visible = []
-        for index in range(await locator.count()):
-            candidate = locator.nth(index)
-            if await candidate.is_visible():
-                visible.append(candidate)
-        if len(visible) == 1:
-            return visible[0]
-        if len(visible) > 1:
+        count = await locator.count()
+        if count == 1:
+            return locator.first
+        if count > 1:
             break
         await asyncio.sleep(0.25)
-    raise RuntimeError(f"{label}应唯一可见，实际找到 {len(visible)} 个")
+    raise RuntimeError(f"{label}应唯一可见，实际找到 {count} 个")
 
 
 async def _wait_optional_unique(locator: Locator) -> Locator | None:
     for _ in range(10):
-        visible = [
-            locator.nth(index)
-            for index in range(await locator.count())
-            if await locator.nth(index).is_visible()
-        ]
-        if len(visible) == 1:
-            return visible[0]
-        if len(visible) > 1:
-            raise RuntimeError(f"登录弹层应唯一可见，实际找到 {len(visible)} 个")
+        count = await locator.count()
+        if count == 1:
+            return locator.first
+        if count > 1:
+            raise RuntimeError(f"登录弹层应唯一可见，实际找到 {count} 个")
         await asyncio.sleep(0.25)
     return None
 

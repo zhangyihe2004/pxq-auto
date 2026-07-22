@@ -16,6 +16,17 @@ USER_AGENT = (
 class PxqError(RuntimeError):
     """票星球接口返回了非成功状态。"""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        comments: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.comments = comments
+
 
 class PxqClient:
     def __init__(self, timeout: float = 15.0):
@@ -27,21 +38,24 @@ class PxqClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def __aenter__(self) -> "PxqClient":
-        return self
-
-    async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
-        await self.aclose()
-
     async def _get(self, path: str, params: dict | None = None) -> Any:
         resp = await self._http.get(BASE_URL + path, params=params)
         resp.raise_for_status()
         payload = resp.json()
         if not isinstance(payload, dict):
             raise PxqError(f"{path} -> 响应不是 JSON 对象")
-        if payload.get("statusCode") != 200:
+        if str(payload.get("statusCode")) != "200":
+            raw_status = payload.get("statusCode")
+            status_code = (
+                int(raw_status)
+                if isinstance(raw_status, (int, str)) and str(raw_status).isdigit()
+                else None
+            )
+            comments = str(payload.get("comments") or "")
             raise PxqError(
-                f"{path} -> statusCode={payload.get('statusCode')} {payload.get('comments')}"
+                f"{path} -> statusCode={raw_status} {comments}",
+                status_code=status_code,
+                comments=comments,
             )
         return payload.get("data")
 

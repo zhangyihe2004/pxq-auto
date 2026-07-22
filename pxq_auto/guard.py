@@ -11,11 +11,7 @@ from playwright.async_api import Request, Route
 
 
 GuardStatus = Literal["READY", "SUBMITTING", "CREATED", "UNKNOWN"]
-CREATE_MARKERS = (
-    "/trade/buyer/v1/items/orders/submit",
-    "/create_order",
-    "/createorder",
-)
+CREATE_PATH = "/trade/buyer/v1/items/orders/submit"
 
 
 @dataclass
@@ -32,20 +28,34 @@ class PersistentOrderGuard:
         self.plan_key = plan_key
 
     def current(self) -> OrderState:
-        if not self.path.exists():
-            return self._new("READY")
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if raw.get("plan_key") != self.plan_key:
+            state = self.load(self.path)
+            if state is None:
                 return self._new("READY")
-            return OrderState(
-                plan_key=self.plan_key,
-                status=raw["status"],
-                updated_at=raw["updated_at"],
-                order_id=raw.get("order_id"),
-            )
+            if state.plan_key != self.plan_key:
+                if state.status != "READY":
+                    raise RuntimeError(
+                        "状态文件属于其他配置且仍有订单保护，请先人工核对并重置"
+                    )
+                return self._new("READY")
+            return state
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise RuntimeError(f"下单状态文件损坏，请人工检查：{self.path}") from exc
+
+    @staticmethod
+    def load(path: Path) -> OrderState | None:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        status = raw["status"]
+        if status not in {"READY", "SUBMITTING", "CREATED", "UNKNOWN"}:
+            raise ValueError(f"未知状态：{status}")
+        return OrderState(
+            plan_key=str(raw["plan_key"]),
+            status=status,
+            updated_at=str(raw["updated_at"]),
+            order_id=raw.get("order_id"),
+        )
 
     def require_ready(self) -> None:
         state = self.current()
@@ -66,6 +76,10 @@ class PersistentOrderGuard:
 
     def unknown(self) -> None:
         self._write(self._new("UNKNOWN"))
+
+    @staticmethod
+    def clear(path: Path) -> None:
+        path.unlink(missing_ok=True)
 
     def _new(
         self,
@@ -105,7 +119,7 @@ class OrderFirewall:
             return
 
         request_url = request.url.lower()
-        is_create = any(marker in request_url for marker in CREATE_MARKERS)
+        is_create = CREATE_PATH in request_url
         if is_create:
             if self.armed and not self.attempt_allowed:
                 self.attempt_allowed = True
