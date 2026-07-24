@@ -31,9 +31,10 @@ class AuthGuard:
     def __init__(
         self,
         site: PurchasePage,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.site = site
-        self.headers: dict[str, str] = {}
+        self.headers = headers if headers is not None else {}
         self._verified_at = 0.0
         root = f"{site.origin}/cyy_gatewayapi/show"
         self.endpoint = f"{root}/buyer/v5/show/{site.show_id}/show_user"
@@ -48,7 +49,8 @@ class AuthGuard:
             headers = await capture_authenticated_headers(self.site)
         except AuthenticationRequired:
             raise AuthenticationRequired("登录状态无效，请通过飞书重新登录") from None
-        self.headers = headers
+        self.headers.clear()
+        self.headers.update(headers)
         if not await self.check():
             raise AuthenticationRequired("登录状态无效，请通过飞书重新登录")
 

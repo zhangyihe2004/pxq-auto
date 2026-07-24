@@ -508,17 +508,18 @@ class TaskScheduler:
                 return "绑定状态竞争失败"
             try:
                 async with self.browsers.use(account_id, config.browser) as context:
-                    try:
-                        result = await run_account(
-                            config,
-                            context,
-                            prewarm=prewarm,
-                            trace_label=f"任务 #{task['id']}｜账号 #{account_id}",
-                        )
-                    finally:
-                        for page in tuple(context.pages):
-                            with suppress(Exception):
-                                await page.close()
+                    warm = await self.browsers.task_page(
+                        account_id, task_id, context
+                    )
+                    result = await run_account(
+                        config,
+                        context,
+                        prewarm=prewarm,
+                        trace_label=f"任务 #{task['id']}｜账号 #{account_id}",
+                        page=warm.page,
+                        auth_headers=warm.auth_headers,
+                        page_changed=warm.adopt,
+                    )
             except asyncio.CancelledError:
                 current = self.db.get_binding(task_id, account_id)
                 if current:
@@ -539,6 +540,8 @@ class TaskScheduler:
                         )
                 raise
             except Exception as exc:
+                with suppress(Exception):
+                    await self.browsers.close_task_page(account_id, task_id)
                 log.exception("账号 #%s 抢票执行失败", account_id)
                 current = self.db.get_binding(task_id, account_id)
                 result = RunResult("FAILED", str(exc))
@@ -563,6 +566,15 @@ class TaskScheduler:
                         )
                 self._notify_result(task_id, account_id, task, result)
                 return result.status
+            if not result.reuse_page:
+                with suppress(Exception):
+                    await self.browsers.close_task_page(account_id, task_id)
+            else:
+                log.info(
+                    "任务 #%s 账号 #%s 保留热页面，供下一轮复用",
+                    task_id,
+                    account_id,
+                )
             self.db.apply_fulfillment(
                 task_id,
                 account_id,
@@ -717,12 +729,21 @@ class TaskScheduler:
             activity.cancel()
         if activities:
             await asyncio.gather(*activities, return_exceptions=True)
+        await self.browsers.close_task_page(account_id, task_id)
 
     async def release_account_if_idle(self, account_id: int) -> None:
-        if not self.db.list_bindings(account_id=account_id):
-            for pending in self.pending_notices.values():
-                pending.pop(f"login:{account_id}", None)
-            await self.browsers.close(account_id)
+        active = any(
+            binding["enabled"]
+            and binding["status"] in {"READY", "RUNNING"}
+            and (task := self.db.get_task(binding["task_id"]))
+            and task["status"] == "active"
+            for binding in self.db.list_bindings(account_id=account_id)
+        )
+        if active:
+            return
+        for pending in self.pending_notices.values():
+            pending.pop(f"login:{account_id}", None)
+        await self.browsers.close(account_id)
 
     async def cancel_account(
         self, account_id: int, *, reason: str = "账号操作"
@@ -748,6 +769,10 @@ class TaskScheduler:
         await self.browsers.close(account_id)
 
     async def cancel_task(self, task_id: int, *, reason: str = "任务操作") -> None:
+        account_ids = {
+            int(binding["account_id"])
+            for binding in self.db.list_bindings(task_id=task_id)
+        }
         self._move_login_notices(task_id)
         self.pending_notices.pop(task_id, None)
         await asyncio.gather(
@@ -761,6 +786,9 @@ class TaskScheduler:
             )
         )
         self._clear_runtime_state(task_id)
+        await asyncio.gather(
+            *(self.release_account_if_idle(account_id) for account_id in account_ids)
+        )
 
     def _move_login_notices(self, task_id: int) -> None:
         pending = self.pending_notices.get(task_id)
@@ -804,7 +832,7 @@ class TaskScheduler:
             raise ValueError("账号正在执行其他任务，请稍后重试")
         config = build_login_config(task, account, self.system)
         async with self.browsers.use(account_id, config.browser) as context:
-            page = context.pages[0] if context.pages else await context.new_page()
+            page = await context.new_page()
             site = PurchasePage(page, config)
             try:
                 return await AuthGuard(site).audiences()

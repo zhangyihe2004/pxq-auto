@@ -34,10 +34,12 @@ class PurchasePage:
         page: Page,
         config: AccountRunConfig,
         timing: Callable[[str, float], None] | None = None,
+        adopt_page: Callable[[Page], Awaitable[None]] | None = None,
     ) -> None:
         self.page = page
         self.config = config
         self._timing = timing
+        self._adopt_page = adopt_page
         self._pick_seat_url: str | None = None
         booking = urlsplit(config.project.booking_url)
         self._booking_path = booking.path.rstrip("/")
@@ -261,6 +263,15 @@ class PurchasePage:
             raise RuntimeError("订单页实际选中的观演人与配置不完全一致")
 
     async def open_seat_map(self) -> None:
+        current = urlsplit(self.page.url)
+        query = parse_qs(current.query)
+        if (
+            current.path == "/pick-seat"
+            and (query.get("showId") or [""])[0] == self._show_id
+            and (query.get("bizShowSessionId") or [""])[0] == self._session_id
+        ):
+            self._pick_seat_url = self.page.url
+            return
         go_pick = await self._poll(
             lambda: self._enabled_action(BOOKING_ACTION_SELECTOR, "去选座")
         )
@@ -276,6 +287,28 @@ class PurchasePage:
         if urlsplit(self.page.url).path != "/pick-seat":
             raise RuntimeError("进入选座流程后未到达官方选座页")
         self._pick_seat_url = self.page.url
+
+    async def reusable_task_page(self) -> bool:
+        if self.page.is_closed():
+            return False
+        current = urlsplit(self.page.url)
+        query = parse_qs(current.query)
+        session_id = (query.get("saleShowSessionId") or [""])[0]
+        if current.path == "/pick-seat":
+            session_id = (query.get("bizShowSessionId") or [""])[0]
+            valid = (
+                (query.get("showId") or [""])[0] == self._show_id
+                and session_id == self._session_id
+                and not await self.page.locator(".seat-item").count()
+            )
+        else:
+            valid = (
+                current.path.rstrip("/") == self._booking_path
+                and session_id == self._session_id
+            )
+        return valid and not await self.page.locator(
+            "#global-loding .loading-wrapper:visible"
+        ).count()
 
     async def _set_quantity(self, target: int) -> None:
         current = await self._poll(self._current_quantity)
@@ -359,6 +392,8 @@ class PurchasePage:
             ]
             if new_pages:
                 self.page = new_pages[-1]
+                if self._adopt_page is not None:
+                    await self._adopt_page(self.page)
                 await self.page.wait_for_load_state("domcontentloaded")
                 pages_before.add(self.page)
             if self.page.url not in {url_before, "about:blank"}:

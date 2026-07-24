@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TypeVar
 
+from playwright.async_api import Page
+
 from .auth import AuthGuard, AuthenticationRequired
-from .browser import save_screenshot
+from .browser import blank_page, save_screenshot
 from .config import AccountRunConfig, AudienceConfig
 from .order_guard import OrderFirewall, PersistentOrderGuard
 from .inventory import (
@@ -60,6 +62,7 @@ class RunResult:
     order_id: str | None = None
     removed_audiences: tuple[str, ...] = ()
     fulfilled_quantity: int = 0
+    reuse_page: bool = False
 
 
 @dataclass
@@ -105,20 +108,66 @@ async def run_account(
     *,
     prewarm: bool,
     trace_label: str | None = None,
+    page: Page | None = None,
+    auth_headers: dict[str, str] | None = None,
+    page_changed: Callable[[Page], None] | None = None,
 ) -> RunResult:
     """执行一个账号的一次自动抢票生命周期，最多成功创建一个订单。"""
     if not config.create_order:
         return RunResult("DISABLED", "全局 create_order_enabled 尚未开启")
-    page = context.pages[0] if context.pages else await context.new_page()
-    timings = RunTimings(trace_label or config.project.name)
-    site = PurchasePage(page, config, timings.record)
+    if page is None:
+        page = await blank_page(context)
     firewall = OrderFirewall()
-    await page.route("**/*", firewall.route)
+    route_handler = firewall.route
     watcher = CreateResponseWatcher()
-    page.on("response", watcher.handle)
+    response_handler = watcher.handle
+    instrumented: set[Page] = set()
+
+    async def instrument(target: Page) -> None:
+        if target in instrumented:
+            return
+        await target.route("**/*", route_handler)
+        target.on("response", response_handler)
+        instrumented.add(target)
+        if page_changed is not None:
+            page_changed(target)
+
+    await instrument(page)
+    try:
+        return await _run_account(
+            config,
+            page,
+            firewall,
+            watcher,
+            prewarm=prewarm,
+            trace_label=trace_label,
+            auth_headers=auth_headers,
+            adopt_page=instrument,
+        )
+    finally:
+        for target in tuple(instrumented):
+            with suppress(Exception):
+                target.remove_listener("response", response_handler)
+            with suppress(Exception):
+                await target.unroute("**/*", route_handler)
+
+
+async def _run_account(
+    config: AccountRunConfig,
+    page: Page,
+    firewall: OrderFirewall,
+    watcher: CreateResponseWatcher,
+    *,
+    prewarm: bool,
+    trace_label: str | None,
+    auth_headers: dict[str, str] | None,
+    adopt_page: Callable[[Page], Awaitable[None]],
+) -> RunResult:
+    timings = RunTimings(trace_label or config.project.name)
+    site = PurchasePage(page, config, timings.record, adopt_page)
     guard = PersistentOrderGuard(config.state_path, config.plan_key)
     guard.require_ready()
-    auth = AuthGuard(site)
+    auth = AuthGuard(site, auth_headers)
     try:
         await auth.ensure()
     except AuthenticationRequired:
@@ -131,6 +180,7 @@ async def run_account(
     ticket_quantity = config.purchase.quantity
     removed: list[str] = []
     fulfilled_quantity = 0
+    page_ready = False
     try:
         if not config.project.support_seat_picking:
             if prewarm:
@@ -195,10 +245,16 @@ async def run_account(
                 current = seat_source or await bootstrap.wait_static()
                 return current, await current.wait_available(ticket_quantity)
 
+            async def open_ready_seat_map() -> None:
+                nonlocal page_ready
+                await site.open_seat_map()
+                page_ready = True
+
             timings.begin(1)
             seat_source, seat_selection = await _parallel_result(
                 wait_selection(),
-                _measure(timings, "seat_page", site.open_seat_map()),
+                _measure(timings, "seat_page", open_ready_seat_map()),
+                finish_side_on_unavailable=True,
             )
             prepared = await _prepare_seat_order(
                 site, seat_selection, people, timings=timings
@@ -212,9 +268,15 @@ async def run_account(
                 current = await Inventory.open(site, auth)
                 return current, await current.refresh(ticket_quantity)
 
+            async def open_ready_seat_map() -> None:
+                nonlocal page_ready
+                await site.open_seat_map()
+                page_ready = True
+
             seat_source, seat_selection = await _parallel_result(
                 load_selection(),
-                _measure(timings, "seat_page", site.open_seat_map()),
+                _measure(timings, "seat_page", open_ready_seat_map()),
+                finish_side_on_unavailable=True,
             )
             prepared = await _prepare_seat_order(
                 site, seat_selection, people, timings=timings
@@ -224,12 +286,26 @@ async def run_account(
     except AuthenticationRequired:
         timings.finish("NEEDS_LOGIN")
         return RunResult("NEEDS_LOGIN", "登录状态已失效")
-    except (InventoryUnavailable, SaleUnavailable):
+    except InventoryUnavailable:
         timings.finish("RESTOCK")
-        return RunResult("RESTOCK", "配置票档当前没有可售库存")
+        return RunResult(
+            "RESTOCK",
+            "配置票档当前没有可售库存",
+            reuse_page=(
+                (not config.project.support_seat_picking or page_ready)
+                and await site.reusable_task_page()
+            ),
+        )
+    except SaleUnavailable:
+        timings.finish("RESTOCK")
+        return RunResult("RESTOCK", "当前场次尚不可执行")
     except StaticInventoryUnavailable:
         timings.finish("STATIC_UNAVAILABLE")
-        return RunResult("RESTOCK", "静态座位资源尚未下发")
+        return RunResult(
+            "RESTOCK",
+            "静态座位资源尚未下发",
+            reuse_page=page_ready and await site.reusable_task_page(),
+        )
     except Exception:
         timings.finish("PREPARE_FAILED")
         await _save_failure(site, config, "prepare-failed")
@@ -515,12 +591,23 @@ async def _measure(
         timings.record(stage, asyncio.get_running_loop().time() - started)
 
 
-async def _parallel_result(result_coro, side_coro):
+async def _parallel_result(
+    result_coro,
+    side_coro,
+    *,
+    finish_side_on_unavailable: bool = False,
+):
     result = asyncio.create_task(result_coro)
     side = asyncio.create_task(side_coro)
     try:
         value, _ = await asyncio.gather(result, side)
         return value
+    except InventoryUnavailable:
+        result.cancel()
+        if not finish_side_on_unavailable:
+            side.cancel()
+        await asyncio.gather(side, return_exceptions=True)
+        raise
     except BaseException:
         result.cancel()
         side.cancel()
@@ -529,7 +616,7 @@ async def _parallel_result(result_coro, side_coro):
 
 
 async def check_login(config: AccountRunConfig, context) -> bool:
-    page = context.pages[0] if context.pages else await context.new_page()
+    page = await context.new_page()
     site = PurchasePage(page, config)
     try:
         await AuthGuard(site).ensure()
