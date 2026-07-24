@@ -20,7 +20,6 @@ from .config import (
 )
 from .db import Database
 from .feishu import FeishuGateway, IncomingCommand
-from .account_guidance import next_step
 from .purchase_page import PurchasePage
 
 
@@ -52,7 +51,6 @@ class LoginSession:
     last_message_id: str = ""
     touched_at: float = 0.0
     release_on_failure: bool = False
-    success_status: str = "STOPPED"
 
 
 class FeishuLoginManager:
@@ -72,9 +70,11 @@ class FeishuLoginManager:
         self.reply: Callable[[str, str], Awaitable[object]] = feishu.reply_text
         self.sessions: dict[str, LoginSession] = {}
 
-    def start(self, command: IncomingCommand, task_id: int) -> str:
-        if not self.db.get_task(task_id):
-            return f"抢票任务 #{task_id} 不存在。"
+    def start(self, command: IncomingCommand) -> str:
+        tasks = self.db.list_tasks()
+        if not tasks:
+            return "当前没有抢票任务，请先搜索并创建任务。"
+        task_id = int(tasks[0]["id"])
         if command.sender_open_id in self.sessions:
             return "你已有登录流程进行中；发送“取消”后才能重新开始。"
         self.sessions[command.sender_open_id] = LoginSession(
@@ -84,8 +84,8 @@ class FeishuLoginManager:
             touched_at=time.monotonic(),
         )
         return (
-            f"登录抢票任务 #{task_id} 的账号。\n"
-            "请发送 11 位手机号；系统会先检查全局唯一性，再发起登录请求。\n"
+            "登录票星球账号。\n"
+            "请发送 11 位手机号；系统会先检查是否已有账号，再发起登录请求。\n"
             "退出：取消"
         )
 
@@ -100,14 +100,8 @@ class FeishuLoginManager:
             release = session.release_on_failure
             await self._drop(session, release=session.release_on_failure)
             if account_id and not release:
-                status = self._failure_status(session)
-                self.db.set_account_status(account_id, status)
-                detail = (
-                    "账号资料和订单保护状态已保留。"
-                    if status in {"CREATED", "UNKNOWN", "COMPLETE"}
-                    else "账号资料已保留，状态为登录失效。"
-                )
-                return f"登录已取消；{detail}"
+                self.db.set_account_status(account_id, "NEEDS_LOGIN")
+                return "登录已取消；账号资料已保留，状态为登录失效。"
             if release:
                 return "登录已取消；新账号占用已释放。"
             return "登录已取消。"
@@ -125,12 +119,12 @@ class FeishuLoginManager:
             await self._drop(session, release=session.release_on_failure)
             if session.account_id and not session.release_on_failure:
                 self.db.set_account_status(
-                    session.account_id, self._failure_status(session), error=str(exc)
+                    session.account_id, "NEEDS_LOGIN", error=str(exc)
                 )
             suffix = (
                 "手机号占用已释放"
                 if session.release_on_failure
-                else f"账号仍保留，可再次发送“登录 {session.task_id}”"
+                else "账号仍保留，可再次发送“登录”"
             )
             return f"登录失败：{exc}\n{suffix}。"
 
@@ -147,13 +141,13 @@ class FeishuLoginManager:
                 await self._drop(session, release=session.release_on_failure)
                 if session.account_id and not session.release_on_failure:
                     self.db.set_account_status(
-                        session.account_id, self._failure_status(session)
+                        session.account_id, "NEEDS_LOGIN"
                     )
                 if session.last_message_id:
                     detail = (
                         "新手机号占用已释放。"
                         if session.release_on_failure
-                        else f"账号资料已保留；可再次发送：登录 {session.task_id}"
+                        else "账号资料已保留；可再次发送：登录"
                     )
                     await self.reply(
                         session.last_message_id,
@@ -164,33 +158,16 @@ class FeishuLoginManager:
         for session in list(self.sessions.values()):
             await self._drop(session, release=session.release_on_failure)
 
-    @staticmethod
-    def _failure_status(session: LoginSession) -> str:
-        return (
-            session.success_status
-            if session.success_status in {"CREATED", "UNKNOWN", "COMPLETE"}
-            else "NEEDS_LOGIN"
-        )
-
     async def _phone(self, session: LoginSession, command: IncomingCommand) -> str:
         phone = validate_phone(command.text)
         account = self.db.get_account_by_phone(phone)
         if account:
-            if account["task_id"] != session.task_id:
-                raise ValueError(
-                    f"该手机号已绑定抢票任务 #{account['task_id']}，一个账号只能绑定一个场次"
-                )
             session.account_id = int(account["id"])
-            session.success_status = (
-                account["status"]
-                if account["status"] in {"CREATED", "UNKNOWN", "COMPLETE"}
-                else "STOPPED"
-            )
-            self.db.deactivate_account(account["id"])
             await self.cancel_account_worker(account["id"])
+            self.db.set_account_status(account["id"], "NEEDS_LOGIN")
         else:
             # 唯一性必须先在 BEGIN IMMEDIATE 中确定；此行之前没有包含手机号的网络请求。
-            account = self.db.reserve_account(session.task_id, phone)
+            account = self.db.reserve_account(phone)
             session.account_id = int(account["id"])
             session.release_on_failure = True
         return await self._begin_login(session, command, account, phone)
@@ -222,7 +199,7 @@ class FeishuLoginManager:
             else:
                 assert session.account_id is not None
                 account_id = session.account_id
-                self.db.set_account_status(account_id, session.success_status)
+                self.db.set_account_status(account_id, "READY")
                 await self._drop(session, release=False)
                 return (
                     f"账号 #{account_id} 当前登录状态仍然有效，无需重新验证。"
@@ -316,13 +293,12 @@ class FeishuLoginManager:
         await session.login.wait_for(state="hidden", timeout=10_000)
         assert session.account_id is not None
         account_id = session.account_id
-        self.db.set_account_status(account_id, session.success_status)
+        self.db.set_account_status(account_id, "READY")
         await self._drop(session, release=False)
         return f"账号 #{account_id} 登录成功。{self._configuration_prompt(account_id)}"
 
     def _configuration_prompt(self, account_id: int) -> str:
-        step = next_step(self.db, account_id)
-        return f"\n\n{step}" if step else ""
+        return f"\n\n下一步：绑定 <任务ID> {account_id}"
 
     async def _send_captcha(self, session: LoginSession, message_id: str) -> None:
         assert session.page is not None

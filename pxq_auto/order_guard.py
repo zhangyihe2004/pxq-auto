@@ -44,7 +44,7 @@ class PersistentOrderGuard:
             if state.plan_key != self.plan_key:
                 if state.status != "READY":
                     raise RuntimeError(
-                        "状态文件属于其他配置且仍有订单保护，请先人工核对并重置"
+                        "状态文件属于其他绑定且仍有订单保护，请先人工核对"
                     )
                 return self._new("READY")
             return state

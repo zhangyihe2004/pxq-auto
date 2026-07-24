@@ -74,7 +74,8 @@ class AccountRunConfig:
 
     @property
     def state_path(self) -> Path:
-        return self.browser.profile_dir.parent / "order-state.json"
+        key = hashlib.sha256(self.project.booking_url.encode()).hexdigest()[:16]
+        return self.browser.profile_dir.parent / "orders" / f"{key}.json"
 
     @property
     def plan_key(self) -> str:
@@ -155,17 +156,17 @@ def profile_key(phone: str) -> str:
 
 
 def build_order_config(
-    task, plans, audiences, account, system: SystemConfig
+    task, plans, audiences, account, binding, system: SystemConfig
 ) -> AccountRunConfig:
     if not plans:
-        raise RuntimeError("账号尚未配置票档")
+        raise RuntimeError("绑定尚未配置票档")
     people = tuple(
         AudienceConfig(person["name"], person["masked_id"]) for person in audiences
     )
-    quantity = int(account["quantity"])
+    quantity = int(binding["quantity"])
     required = required_audience_count(task["real_name_mode"], quantity)
     if quantity < 1 or len(people) != required:
-        raise RuntimeError("账号数量或观演人配置不完整")
+        raise RuntimeError("绑定数量或观演人配置不完整")
     home = account_home(account["profile_key"])
     return AccountRunConfig(
         project=_project_config(task),
@@ -194,7 +195,9 @@ def build_login_config(task, account, system: SystemConfig) -> AccountRunConfig:
             task["session_name"], (), (), 0, task["real_name_mode"], ()
         ),
         browser=BrowserConfig(
-            home / "browser-profile", True, system.browser_timeout_ms
+            home / "browser-profile",
+            system.browser_headless,
+            system.browser_timeout_ms,
         ),
         create_order=False,
     )
@@ -218,17 +221,6 @@ def validate_phone(value: str) -> str:
     if not re.fullmatch(r"1\d{10}", value):
         raise ValueError("请输入 11 位大陆手机号")
     return value
-
-
-def mask_id(value: str) -> str:
-    parts = value.split()
-    if (
-        len(parts) != 2
-        or not re.fullmatch(r"\d{3}", parts[0])
-        or not re.fullmatch(r"[0-9Xx]{4}", parts[1])
-    ):
-        raise ValueError("身份证号只需输入前 3 位和后 4 位，如 110 2321")
-    return f"{parts[0]}{'*' * 11}{parts[1].upper()}"
 
 
 def mask_phone(phone: str) -> str:

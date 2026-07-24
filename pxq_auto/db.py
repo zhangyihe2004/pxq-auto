@@ -49,32 +49,47 @@ CREATE TABLE IF NOT EXISTS task_plans (
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY,
     phone TEXT NOT NULL UNIQUE,
-    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     profile_key TEXT NOT NULL UNIQUE,
-    quantity INTEGER NOT NULL DEFAULT 1,
-    enabled INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'RESERVED',
-    order_id TEXT,
     last_error TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS audiences (
+CREATE TABLE IF NOT EXISTS bindings (
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'STOPPED',
+    order_id TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(task_id, account_id)
+);
+
+CREATE TABLE IF NOT EXISTS binding_audiences (
+    task_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
     position INTEGER NOT NULL,
     name TEXT NOT NULL,
     masked_id TEXT NOT NULL,
-    PRIMARY KEY(account_id, position),
-    UNIQUE(account_id, name, masked_id)
+    PRIMARY KEY(task_id, account_id, position),
+    UNIQUE(task_id, account_id, name, masked_id),
+    FOREIGN KEY(task_id, account_id)
+        REFERENCES bindings(task_id, account_id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS account_plans (
-    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS binding_plans (
+    task_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
     seat_plan_id TEXT NOT NULL,
     priority INTEGER NOT NULL,
-    PRIMARY KEY(account_id, seat_plan_id),
-    UNIQUE(account_id, priority)
+    PRIMARY KEY(task_id, account_id, seat_plan_id),
+    UNIQUE(task_id, account_id, priority),
+    FOREIGN KEY(task_id, account_id)
+        REFERENCES bindings(task_id, account_id) ON DELETE CASCADE
 );
 """
 
@@ -88,52 +103,6 @@ class Database:
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 15000")
         self.connection.executescript(SCHEMA)
-        self._migrate()
-
-    def _migrate(self) -> None:
-        additions = {
-            "tasks": (
-                ("show_limit", "INTEGER NOT NULL DEFAULT 0"),
-                ("session_limitation", "INTEGER NOT NULL DEFAULT 1"),
-                ("real_name_mode", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
-            ),
-            "task_plans": (
-                ("unit_qty", "INTEGER NOT NULL DEFAULT 1"),
-                ("has_combo", "INTEGER NOT NULL DEFAULT 0"),
-            ),
-            "accounts": (("quantity", "INTEGER NOT NULL DEFAULT 1"),),
-        }
-        added: set[tuple[str, str]] = set()
-        for table, columns in additions.items():
-            known = {
-                row["name"]
-                for row in self.connection.execute(f"PRAGMA table_info({table})")
-            }
-            for name, definition in columns:
-                if name not in known:
-                    self.connection.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
-                    )
-                    added.add((table, name))
-        if ("accounts", "quantity") in added:
-            self.connection.execute(
-                """
-                UPDATE accounts
-                SET quantity = MAX(1, (
-                    SELECT COUNT(*) FROM audiences WHERE account_id = accounts.id
-                ))
-                """
-            )
-        if ("tasks", "session_limitation") in added:
-            self.connection.execute(
-                """
-                UPDATE tasks
-                SET session_limitation = MAX(1, COALESCE((
-                    SELECT MAX(limitation) FROM task_plans
-                    WHERE task_id = tasks.id
-                ), 1))
-                """
-            )
 
     def close(self) -> None:
         self.connection.close()
@@ -335,42 +304,32 @@ class Database:
             ).rowcount
         )
 
-    def delete_task(self, task_id: int) -> list[str]:
-        profiles = [
-            row["profile_key"]
-            for row in self.connection.execute(
-                "SELECT profile_key FROM accounts WHERE task_id = ?", (task_id,)
-            )
-        ]
+    def delete_task(self, task_id: int) -> bool:
         with self.connection:
             changed = self.connection.execute(
                 "DELETE FROM tasks WHERE id = ?", (task_id,)
             ).rowcount
-        return profiles if changed else []
+        return bool(changed)
 
-    # ---- 账号与观演人 ----
+    # ---- 账号 ----
 
-    def reserve_account(self, task_id: int, phone: str) -> sqlite3.Row:
+    def reserve_account(self, phone: str) -> sqlite3.Row:
         now = time.time()
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if not self.get_task(task_id):
-                raise ValueError(f"抢票任务 #{task_id} 不存在")
             existing = self.connection.execute(
                 "SELECT * FROM accounts WHERE phone = ?", (phone,)
             ).fetchone()
             if existing:
-                raise ValueError(
-                    f"该手机号已绑定抢票任务 #{existing['task_id']}，一个账号只能绑定一个场次"
-                )
+                raise ValueError(f"手机号已经是账号 #{existing['id']}")
             account_id = self._next_id(self.connection, "accounts")
             self.connection.execute(
                 """
                 INSERT INTO accounts (
-                    id, phone, task_id, profile_key, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'RESERVED', ?, ?)
+                    id, phone, profile_key, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'RESERVED', ?, ?)
                 """,
-                (account_id, phone, task_id, profile_key(phone), now, now),
+                (account_id, phone, profile_key(phone), now, now),
             )
             account = self.get_account(account_id)
             if account is None:
@@ -391,17 +350,147 @@ class Database:
             "SELECT * FROM accounts WHERE phone = ?", (phone,)
         ).fetchone()
 
-    def list_accounts(self, task_id: int | None = None) -> list[sqlite3.Row]:
-        if task_id is None:
-            return self.connection.execute(
-                "SELECT * FROM accounts ORDER BY id"
-            ).fetchall()
-        return self.connection.execute(
-            "SELECT * FROM accounts WHERE task_id = ? ORDER BY id", (task_id,)
-        ).fetchall()
+    def list_accounts(self) -> list[sqlite3.Row]:
+        return self.connection.execute("SELECT * FROM accounts ORDER BY id").fetchall()
 
     def set_account_status(
         self,
+        account_id: int,
+        status: str,
+        *,
+        error: str = "",
+    ) -> bool:
+        with self.connection:
+            changed = self.connection.execute(
+                """
+                UPDATE accounts
+                SET status = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, error, time.time(), account_id),
+            ).rowcount
+            if not changed:
+                return False
+            if status == "NEEDS_LOGIN":
+                self.connection.execute(
+                    """
+                    UPDATE bindings
+                    SET status = 'NEEDS_LOGIN', updated_at = ?
+                    WHERE account_id = ? AND status IN ('READY', 'RUNNING')
+                    """,
+                    (time.time(), account_id),
+                )
+            elif status == "READY":
+                self.connection.execute(
+                    """
+                    UPDATE bindings
+                    SET status = CASE WHEN enabled = 1 THEN 'READY' ELSE 'STOPPED' END,
+                        updated_at = ?
+                    WHERE account_id = ? AND status = 'NEEDS_LOGIN'
+                    """,
+                    (time.time(), account_id),
+                )
+            return True
+
+    def delete_account(self, account_id: int) -> str | None:
+        account = self.get_account(account_id)
+        if not account:
+            return None
+        with self.connection:
+            self.connection.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+        return str(account["profile_key"])
+
+    # ---- 任务账号绑定 ----
+
+    def get_binding(self, task_id: int, account_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM bindings WHERE task_id = ? AND account_id = ?",
+            (task_id, account_id),
+        ).fetchone()
+
+    def list_bindings(
+        self, task_id: int | None = None, account_id: int | None = None
+    ) -> list[sqlite3.Row]:
+        conditions: list[str] = []
+        parameters: list[int] = []
+        if task_id is not None:
+            conditions.append("task_id = ?")
+            parameters.append(task_id)
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        return self.connection.execute(
+            f"SELECT * FROM bindings{where} ORDER BY task_id, account_id",
+            parameters,
+        ).fetchall()
+
+    def begin_binding_configuration(self, task_id: int, account_id: int) -> bool:
+        binding = self.get_binding(task_id, account_id)
+        if binding is None:
+            return bool(self.get_task(task_id) and self.get_account(account_id))
+        return bool(
+            self.connection.execute(
+                """
+                UPDATE bindings
+                SET enabled = 0,
+                    status = CASE WHEN status = 'READY' THEN 'STOPPED' ELSE status END,
+                    updated_at = ?
+                WHERE task_id = ? AND account_id = ? AND status != 'RUNNING'
+                """,
+                (time.time(), task_id, account_id),
+            ).rowcount
+        )
+
+    def activate_binding(self, task_id: int, account_id: int) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            account = self.get_account(account_id)
+            if not account:
+                raise ValueError(f"账号 #{account_id} 不存在")
+            if account["status"] in {"RESERVED", "NEEDS_LOGIN"}:
+                raise ValueError("账号尚未登录")
+            task = self.get_task(task_id)
+            binding = self.get_binding(task_id, account_id)
+            if not task or not binding or not self.get_binding_plans(task_id, account_id):
+                raise ValueError("绑定配置不完整")
+            if int(binding["quantity"]) < 1:
+                raise ValueError("目标数量已完成，请重新绑定并设置数量")
+            people = self.get_binding_audiences(task_id, account_id)
+            required = required_audience_count(
+                task["real_name_mode"], int(binding["quantity"])
+            )
+            if len(people) != required:
+                raise ValueError("绑定观演人配置不完整")
+            self.connection.execute(
+                """
+                UPDATE bindings
+                SET enabled = 1, status = 'READY', last_error = '', updated_at = ?
+                WHERE task_id = ? AND account_id = ?
+                """,
+                (time.time(), task_id, account_id),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def claim_binding(self, task_id: int, account_id: int) -> bool:
+        """仅在绑定仍启用且空闲时原子取得一次执行权。"""
+        return bool(
+            self.connection.execute(
+                """
+                UPDATE bindings SET status = 'RUNNING', updated_at = ?
+                WHERE task_id = ? AND account_id = ?
+                  AND enabled = 1 AND status = 'READY'
+                """,
+                (time.time(), task_id, account_id),
+            ).rowcount
+        )
+
+    def set_binding_status(
+        self,
+        task_id: int,
         account_id: int,
         status: str,
         *,
@@ -412,116 +501,56 @@ class Database:
         return bool(
             self.connection.execute(
                 """
-                UPDATE accounts
+                UPDATE bindings
                 SET status = ?,
-                    enabled = CASE
-                        WHEN ? IN (
-                            'STOPPED', 'NEEDS_LOGIN', 'CREATED', 'UNKNOWN', 'COMPLETE'
-                        )
-                        THEN 0 ELSE enabled
-                    END,
                     order_id = CASE WHEN ? THEN order_id ELSE ? END,
-                    last_error = ?, updated_at = ?
-                WHERE id = ?
+                    last_error = ?,
+                    updated_at = ?
+                WHERE task_id = ? AND account_id = ?
                 """,
                 (
-                    status,
                     status,
                     int(keep_order_id),
                     None if keep_order_id else order_id,
                     error,
                     time.time(),
+                    task_id,
                     account_id,
                 ),
             ).rowcount
         )
 
-    def activate_account(self, account_id: int) -> None:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            account = self.get_account(account_id)
-            if not account:
-                raise ValueError(f"账号 #{account_id} 不存在")
-            if account["status"] in {"RESERVED", "NEEDS_LOGIN"}:
-                raise ValueError("账号尚未登录")
-            if account["status"] in {"CREATED", "UNKNOWN"}:
-                raise ValueError("账号存在订单保护状态")
-            if account["status"] == "COMPLETE":
-                raise ValueError("原目标数量已完成")
-            task = self.get_task(account["task_id"])
-            if not task or not self.get_account_plans(account_id):
-                raise ValueError("账号配置不完整")
-            people = self.get_audiences(account_id)
-            required = required_audience_count(
-                task["real_name_mode"], int(account["quantity"])
-            )
-            if len(people) != required:
-                raise ValueError("账号观演人配置不完整")
-            self.connection.execute(
-                """
-                UPDATE accounts
-                SET enabled = 1, status = 'READY', last_error = '', updated_at = ?
-                WHERE id = ?
-                """,
-                (time.time(), account_id),
-            )
-            self.connection.commit()
-        except Exception:
-            self.connection.rollback()
-            raise
-
-    def claim_account(self, account_id: int) -> bool:
-        """仅在账号仍启用且空闲时原子取得一次执行权。"""
+    def deactivate_binding(self, task_id: int, account_id: int) -> bool:
         return bool(
             self.connection.execute(
                 """
-                UPDATE accounts SET status = 'RUNNING', updated_at = ?
-                WHERE id = ? AND enabled = 1 AND status = 'READY'
-                """,
-                (time.time(), account_id),
-            ).rowcount
-        )
-
-    def begin_account_configuration(self, account_id: int) -> bool:
-        """停止空闲账号；已进入抢票流程时拒绝并发修改。"""
-        return bool(
-            self.connection.execute(
-                """
-                UPDATE accounts
-                SET enabled = 0,
-                    status = CASE WHEN status = 'READY' THEN 'STOPPED' ELSE status END,
-                    updated_at = ?
-                WHERE id = ? AND status != 'RUNNING'
-                """,
-                (time.time(), account_id),
-            ).rowcount
-        )
-
-    def deactivate_account(self, account_id: int) -> bool:
-        return bool(
-            self.connection.execute(
-                """
-                UPDATE accounts
+                UPDATE bindings
                 SET enabled = 0,
                     status = CASE
                         WHEN status IN ('READY', 'RUNNING') THEN 'STOPPED'
                         ELSE status
                     END,
                     updated_at = ?
-                WHERE id = ?
+                WHERE task_id = ? AND account_id = ?
                 """,
-                (time.time(), account_id),
+                (time.time(), task_id, account_id),
             ).rowcount
         )
 
-    def get_audiences(self, account_id: int) -> list[sqlite3.Row]:
+    def get_binding_audiences(
+        self, task_id: int, account_id: int
+    ) -> list[sqlite3.Row]:
         return self.connection.execute(
-            "SELECT * FROM audiences WHERE account_id = ? ORDER BY position",
-            (account_id,),
+            """
+            SELECT * FROM binding_audiences
+            WHERE task_id = ? AND account_id = ? ORDER BY position
+            """,
+            (task_id, account_id),
         ).fetchall()
 
-    def save_account_config(
+    def save_binding_config(
         self,
+        task_id: int,
         account_id: int,
         plan_ids: list[str],
         quantity: int,
@@ -537,69 +566,88 @@ class Database:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             account = self.get_account(account_id)
-            if not account:
-                raise ValueError(f"账号 #{account_id} 不存在")
-            if account["status"] in {"RUNNING", "CREATED", "UNKNOWN"}:
-                raise ValueError("账号当前状态不允许修改配置")
-            task = self.get_task(account["task_id"])
-            if not task:
-                raise ValueError("账号所属任务不存在")
+            task = self.get_task(task_id)
+            if not account or not task:
+                raise ValueError("任务或账号不存在")
+            binding = self.get_binding(task_id, account_id)
+            if binding and binding["status"] == "RUNNING":
+                raise ValueError("绑定正在抢票，当前不能修改")
             maximum = max(1, int(task["session_limitation"]))
             if not 1 <= quantity <= maximum:
                 raise ValueError(f"购票数量必须在 1~{maximum} 之间")
             required = required_audience_count(task["real_name_mode"], quantity)
             if len(people) != required:
                 raise ValueError(f"当前实名规则需要配置 {required} 位观演人")
-            known = {
-                row["seat_plan_id"] for row in self.get_task_plans(account["task_id"])
-            }
+            known = {row["seat_plan_id"] for row in self.get_task_plans(task_id)}
             if not set(plan_ids) <= known:
                 raise ValueError("票档包含其他场次或已失效的编号")
             if masked_ids:
                 placeholders = ",".join("?" for _ in masked_ids)
                 conflict = self.connection.execute(
                     f"""
-                    SELECT a.id, u.masked_id
-                    FROM audiences u
-                    JOIN accounts a ON a.id = u.account_id
-                    WHERE a.task_id = ? AND a.id != ?
-                      AND u.masked_id IN ({placeholders})
+                    SELECT account_id, masked_id
+                    FROM binding_audiences
+                    WHERE task_id = ? AND account_id != ?
+                      AND masked_id IN ({placeholders})
                     LIMIT 1
                     """,
-                    (account["task_id"], account_id, *masked_ids),
+                    (task_id, account_id, *masked_ids),
                 ).fetchone()
                 if conflict:
                     raise ValueError(
-                        f"证件 {conflict['masked_id']} 已配置在同场次账号 #{conflict['id']}"
+                        f"证件 {conflict['masked_id']} 已配置在同场次账号 "
+                        f"#{conflict['account_id']}"
                     )
+            now = time.time()
+            if binding:
+                self.connection.execute(
+                    """
+                    UPDATE bindings
+                    SET quantity = ?, enabled = 0, status = 'STOPPED',
+                        order_id = NULL, last_error = '', updated_at = ?
+                    WHERE task_id = ? AND account_id = ?
+                    """,
+                    (quantity, now, task_id, account_id),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    INSERT INTO bindings (
+                        task_id, account_id, quantity, enabled, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, 0, 'STOPPED', ?, ?)
+                    """,
+                    (task_id, account_id, quantity, now, now),
+                )
             self.connection.execute(
-                "DELETE FROM account_plans WHERE account_id = ?", (account_id,)
+                "DELETE FROM binding_plans WHERE task_id = ? AND account_id = ?",
+                (task_id, account_id),
             )
             self.connection.executemany(
-                "INSERT INTO account_plans (account_id, seat_plan_id, priority) VALUES (?, ?, ?)",
+                """
+                INSERT INTO binding_plans (
+                    task_id, account_id, seat_plan_id, priority
+                ) VALUES (?, ?, ?, ?)
+                """,
                 [
-                    (account_id, plan_id, priority)
+                    (task_id, account_id, plan_id, priority)
                     for priority, plan_id in enumerate(plan_ids, 1)
                 ],
             )
             self.connection.execute(
-                "DELETE FROM audiences WHERE account_id = ?", (account_id,)
+                "DELETE FROM binding_audiences WHERE task_id = ? AND account_id = ?",
+                (task_id, account_id),
             )
             self.connection.executemany(
-                "INSERT INTO audiences (account_id, position, name, masked_id) VALUES (?, ?, ?, ?)",
+                """
+                INSERT INTO binding_audiences (
+                    task_id, account_id, position, name, masked_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
                 [
-                    (account_id, position, name, masked_id)
+                    (task_id, account_id, position, name, masked_id)
                     for position, (name, masked_id) in enumerate(people, 1)
                 ],
-            )
-            self.connection.execute(
-                """
-                UPDATE accounts
-                SET quantity = ?, enabled = 0, status = 'STOPPED', order_id = NULL,
-                    last_error = '', updated_at = ?
-                WHERE id = ?
-                """,
-                (quantity, time.time(), account_id),
             )
             self.connection.commit()
         except Exception:
@@ -608,6 +656,7 @@ class Database:
 
     def apply_fulfillment(
         self,
+        task_id: int,
         account_id: int,
         quantity: int,
         masked_ids: tuple[str, ...],
@@ -619,41 +668,47 @@ class Database:
             if masked_ids:
                 placeholders = ",".join("?" for _ in masked_ids)
                 self.connection.execute(
-                    f"DELETE FROM audiences WHERE account_id = ? "
-                    f"AND masked_id IN ({placeholders})",
-                    (account_id, *masked_ids),
+                    f"""
+                    DELETE FROM binding_audiences
+                    WHERE task_id = ? AND account_id = ?
+                      AND masked_id IN ({placeholders})
+                    """,
+                    (task_id, account_id, *masked_ids),
                 )
             self.connection.execute(
                 """
-                UPDATE accounts
+                UPDATE bindings
                 SET quantity = MAX(0, quantity - ?), updated_at = ?
-                WHERE id = ?
+                WHERE task_id = ? AND account_id = ?
                 """,
-                (max(0, quantity), time.time(), account_id),
+                (max(0, quantity), time.time(), task_id, account_id),
             )
             self.connection.commit()
         except Exception:
             self.connection.rollback()
             raise
 
-    def get_account_plans(self, account_id: int) -> list[sqlite3.Row]:
+    def get_binding_plans(
+        self, task_id: int, account_id: int
+    ) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
-            SELECT p.*, ap.priority AS account_priority
-            FROM account_plans ap
-            JOIN accounts a ON a.id = ap.account_id
+            SELECT p.*, bp.priority AS account_priority
+            FROM binding_plans bp
             JOIN task_plans p
-              ON p.task_id = a.task_id AND p.seat_plan_id = ap.seat_plan_id
-            WHERE ap.account_id = ?
-            ORDER BY ap.priority
+              ON p.task_id = bp.task_id
+             AND p.seat_plan_id = bp.seat_plan_id
+            WHERE bp.task_id = ? AND bp.account_id = ?
+            ORDER BY bp.priority
             """,
-            (account_id,),
+            (task_id, account_id),
         ).fetchall()
 
-    def delete_account(self, account_id: int) -> str | None:
-        account = self.get_account(account_id)
-        if not account:
-            return None
+    def delete_binding(self, task_id: int, account_id: int) -> bool:
         with self.connection:
-            self.connection.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        return str(account["profile_key"])
+            return bool(
+                self.connection.execute(
+                    "DELETE FROM bindings WHERE task_id = ? AND account_id = ?",
+                    (task_id, account_id),
+                ).rowcount
+            )
