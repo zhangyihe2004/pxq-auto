@@ -113,9 +113,9 @@ async def run_account(
     timings = RunTimings(trace_label or config.project.name)
     site = PurchasePage(page, config, timings.record)
     firewall = OrderFirewall()
-    await context.route("**/*", firewall.route)
+    await page.route("**/*", firewall.route)
     watcher = CreateResponseWatcher()
-    context.on("response", watcher.handle)
+    page.on("response", watcher.handle)
     guard = PersistentOrderGuard(config.state_path, config.plan_key)
     guard.require_ready()
     auth = AuthGuard(site)
@@ -329,7 +329,9 @@ async def run_account(
                     "请在票星球逐一核对"
                 )
             if remaining:
-                details.append(f"剩余目标 {remaining} 张将在本单处理并重置后继续等待")
+                details.append(
+                    f"处理本单后再次启动绑定，可继续等待剩余 {remaining} 张"
+                )
             return RunResult(
                 "CREATED",
                 "\n".join(details),
@@ -534,6 +536,9 @@ async def check_login(config: AccountRunConfig, context) -> bool:
         return True
     except AuthenticationRequired:
         return False
+    finally:
+        with suppress(Exception):
+            await page.close()
 
 
 async def _save_failure(

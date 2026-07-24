@@ -13,7 +13,12 @@ import httpx
 from . import __version__
 from .public_api import PxqClient, PxqError
 from .command_worker import CommandWorker
-from .config import CONFIG_PATH, DB_PATH, account_home, load_system_config
+from .config import (
+    CONFIG_PATH,
+    DB_PATH,
+    build_login_config,
+    load_system_config,
+)
 from .db import Database
 from .scheduler import TaskScheduler
 from .feishu import FeishuError, FeishuGateway, IncomingCommand
@@ -63,7 +68,7 @@ async def _serve() -> None:
     )
     system = load_system_config()
     db = Database(DB_PATH)
-    _recover_accounts(db)
+    _recover_bindings(db, system)
     client = PxqClient()
     queue: asyncio.Queue[IncomingCommand] = asyncio.Queue(maxsize=100)
     feishu = FeishuGateway(system.raw, queue)
@@ -130,26 +135,34 @@ def _doctor() -> None:
     print("检查：通过")
 
 
-def _recover_accounts(db: Database) -> None:
-    for account in db.list_accounts():
-        path = account_home(account["profile_key"]) / "order-state.json"
+def _recover_bindings(db: Database, system) -> None:
+    for binding in db.list_bindings():
+        account = db.get_account(binding["account_id"])
+        task = db.get_task(binding["task_id"])
+        if not account or not task:
+            continue
+        path = build_login_config(task, account, system).state_path
         try:
             state = PersistentOrderGuard.load(path)
         except (OSError, ValueError, KeyError, TypeError):
-            db.set_account_status(
-                account["id"], "UNKNOWN", error="订单保护文件损坏，请人工核对"
+            db.set_binding_status(
+                task["id"],
+                account["id"],
+                "UNKNOWN",
+                error="订单保护文件损坏，请人工核对",
             )
             continue
         if state and state.status in {"SUBMITTING", "CREATED", "UNKNOWN"}:
             status = "UNKNOWN" if state.status == "SUBMITTING" else state.status
-            db.set_account_status(
+            db.set_binding_status(
+                task["id"],
                 account["id"],
                 status,
                 order_id=state.order_id,
                 error="服务在创建订单时中断，请人工核对" if status == "UNKNOWN" else "",
             )
-        elif account["status"] == "RUNNING":
-            db.set_account_status(account["id"], "STOPPED")
+        elif binding["status"] == "RUNNING":
+            db.set_binding_status(task["id"], account["id"], "STOPPED")
 
 
 async def _test_feishu() -> None:

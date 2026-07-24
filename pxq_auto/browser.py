@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager, suppress
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from pathlib import Path
 
 from playwright.async_api import BrowserContext, Error, Playwright, async_playwright
@@ -10,7 +12,9 @@ from .config import BrowserConfig
 
 
 @asynccontextmanager
-async def persistent_browser(config: BrowserConfig):
+async def persistent_browser(
+    config: BrowserConfig,
+) -> AsyncIterator[BrowserContext]:
     config.profile_dir.mkdir(parents=True, exist_ok=True)
     playwright: Playwright = await async_playwright().start()
     context: BrowserContext | None = None
@@ -50,6 +54,49 @@ async def persistent_browser(config: BrowserConfig):
                 await context.close()
         with suppress(Error):
             await playwright.stop()
+
+
+class AccountBrowserPool:
+    """每个账号保留一个浏览器；同一账号的页面操作严格串行。"""
+
+    def __init__(self) -> None:
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._managers: dict[int, AbstractAsyncContextManager[BrowserContext]] = {}
+        self._contexts: dict[int, BrowserContext] = {}
+
+    @asynccontextmanager
+    async def use(
+        self, account_id: int, config: BrowserConfig
+    ) -> AsyncIterator[BrowserContext]:
+        lock = self._locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            context = self._contexts.get(account_id)
+            if context is None:
+                manager = persistent_browser(config)
+                context = await manager.__aenter__()
+                self._managers[account_id] = manager
+                self._contexts[account_id] = context
+            try:
+                yield context
+            except Error as exc:
+                if "closed" in str(exc).lower():
+                    closed_manager = self._managers.pop(account_id, None)
+                    self._contexts.pop(account_id, None)
+                    if closed_manager is not None:
+                        await closed_manager.__aexit__(None, None, None)
+                raise
+
+    async def close(self, account_id: int) -> None:
+        lock = self._locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            manager = self._managers.pop(account_id, None)
+            self._contexts.pop(account_id, None)
+            if manager is not None:
+                await manager.__aexit__(None, None, None)
+
+    async def close_all(self) -> None:
+        for account_id in tuple(self._managers):
+            await self.close(account_id)
 
 
 async def save_screenshot(page, directory: Path, name: str) -> Path:

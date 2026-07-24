@@ -201,8 +201,10 @@ def _string_value(value: object) -> str | None:
 
 
 def _positive_int(value: object) -> int | None:
+    if not isinstance(value, (str, int)):
+        return None
     try:
         result = int(value)
-    except (TypeError, ValueError, OverflowError):
+    except (ValueError, OverflowError):
         return None
     return result if result > 0 else None

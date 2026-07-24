@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
@@ -16,6 +18,13 @@ class AuthenticationError(RuntimeError):
 
 class AuthenticationRequired(AuthenticationError):
     pass
+
+
+@dataclass(frozen=True)
+class OfficialAudience:
+    id: str
+    name: str
+    masked_id: str
 
 
 class AuthGuard:
@@ -81,6 +90,37 @@ class AuthGuard:
         self._verified_at = asyncio.get_running_loop().time()
         return True
 
+    async def audiences(self) -> tuple[OfficialAudience, ...]:
+        await self.ensure()
+        query = urlencode(request_context(self.headers))
+        response = await self.site.page.context.request.get(
+            f"{self.site.origin}/cyy_gatewayapi/user/buyer/v3/"
+            f"user_audiences?{query}",
+            headers=self.headers,
+        )
+        if not response.ok:
+            raise AuthenticationError(f"读取官方观演人返回 HTTP {response.status}")
+        payload = await response.json()
+        if not isinstance(payload, dict) or str(payload.get("statusCode")) != "200":
+            raise AuthenticationError("读取官方观演人失败")
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise AuthenticationError("官方观演人响应格式错误")
+        result: list[OfficialAudience] = []
+        for item in data:
+            if (
+                not isinstance(item, dict)
+                or item.get("isValid") is False
+                or item.get("selectable") is False
+            ):
+                continue
+            audience_id = str(item.get("id") or "").strip()
+            name = str(item.get("name") or "").strip()
+            masked_id = _mask_document(str(item.get("idNo") or ""))
+            if audience_id and name and masked_id:
+                result.append(OfficialAudience(audience_id, name, masked_id))
+        return tuple(result)
+
     @staticmethod
     def interval(remaining_seconds: float) -> float:
         if remaining_seconds > 3600:
@@ -133,3 +173,10 @@ async def capture_authenticated_headers(site: PurchasePage) -> dict[str, str]:
         for name, value in request.headers.items()
         if not name.startswith(":") and name.lower() not in {"host", "content-length"}
     }
+
+
+def _mask_document(value: str) -> str:
+    value = re.sub(r"\s+", "", value)
+    if len(value) < 7:
+        return ""
+    return f"{value[:3]}{'*' * (len(value) - 7)}{value[-4:]}"

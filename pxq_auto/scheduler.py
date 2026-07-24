@@ -5,15 +5,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 
 from .public_api import PxqError
-from .auth import AuthGuard
-from .browser import persistent_browser
-from .config import AccountRunConfig, SystemConfig, build_order_config
+from .auth import AuthGuard, OfficialAudience
+from .browser import AccountBrowserPool
+from .config import (
+    AccountRunConfig,
+    SystemConfig,
+    build_login_config,
+    build_order_config,
+)
 from .db import Database
 from .feishu import FeishuGateway
 from .order_guard import PersistentOrderGuard
+from .purchase_page import PurchasePage
 from .checkout import RunResult, check_login, run_account
 from .sale_state import (
     ACTIVE_SESSION_STATUSES,
@@ -58,7 +65,9 @@ class TaskScheduler:
         self.system = system
         self.semaphore = asyncio.Semaphore(system.max_concurrent_accounts)
         self.jobs: dict[int, asyncio.Task] = {}
+        self.job_bindings: dict[int, tuple[int, int]] = {}
         self.checks: dict[int, asyncio.Task] = {}
+        self.browsers = AccountBrowserPool()
         self.next_poll: dict[int, float] = {}
         self.next_auth: dict[int, float] = {}
         self.failures: dict[int, int] = {}
@@ -194,18 +203,25 @@ class TaskScheduler:
             self.phases[task_id] = phase
         prewarm = phase == "PREWARM"
         if self.system.create_order_enabled:
-            for account in self.db.list_accounts(task_id):
-                account_plans = self.db.get_account_plans(account["id"])
+            for binding in self.db.list_bindings(task_id=task_id):
+                account = self.db.get_account(binding["account_id"])
+                if not account or account["status"] != "READY":
+                    continue
+                account_plans = self.db.get_binding_plans(
+                    task_id, binding["account_id"]
+                )
                 available = any(
                     plan["sale_started"] and plan["can_buy_count"] > 0
                     for plan in account_plans
                 )
                 if (
-                    account["enabled"]
-                    and account["status"] == "READY"
+                    binding["enabled"]
+                    and binding["status"] == "READY"
                     and (prewarm or (phase == "AVAILABLE" and available))
                 ):
-                    self._start_account(account["id"], prewarm=prewarm)
+                    self._start_binding(
+                        task_id, int(binding["account_id"]), prewarm=prewarm
+                    )
 
         self._update_stock_notice(task, plans, phase)
         self._schedule_login_checks(task, remaining)
@@ -276,9 +292,9 @@ class TaskScheduler:
     def _available_plan_ids(self, task_id: int, plans, phase: str) -> set[str]:
         watched = {
             str(plan["seat_plan_id"])
-            for account in self.db.list_accounts(task_id)
-            if account["enabled"]
-            for plan in self.db.get_account_plans(account["id"])
+            for binding in self.db.list_bindings(task_id=task_id)
+            if binding["enabled"]
+            for plan in self.db.get_binding_plans(task_id, binding["account_id"])
         }
         return {
             str(plan["seat_plan_id"])
@@ -387,23 +403,30 @@ class TaskScheduler:
         ):
             mapping.pop(task_id, None)
 
-    def _start_account(self, account_id: int, *, prewarm: bool) -> None:
+    def _start_binding(
+        self, task_id: int, account_id: int, *, prewarm: bool
+    ) -> None:
         if account_id in self.jobs:
             log.debug("账号 #%s 已有执行任务，忽略重复启动", account_id)
             return
-        account = self.db.get_account(account_id)
-        task_id = int(account["task_id"]) if account else None
         mode = "开售预热" if prewarm else "回流抢票"
         log.info("任务 #%s 账号 #%s 已加入执行队列（%s）", task_id, account_id, mode)
         job = asyncio.create_task(
-            self._run_after_check(account_id, prewarm, self.checks.get(account_id)),
-            name=f"pxq-account-{account_id}-{'prewarm' if prewarm else 'available'}",
+            self._run_after_check(
+                task_id, account_id, prewarm, self.checks.get(account_id)
+            ),
+            name=(
+                f"pxq-binding-{task_id}-{account_id}-"
+                f"{'prewarm' if prewarm else 'available'}"
+            ),
         )
         self.jobs[account_id] = job
+        self.job_bindings[account_id] = (task_id, account_id)
 
         def forget_job(_job: asyncio.Task) -> None:
             if self.jobs.get(account_id) is _job:
                 self.jobs.pop(account_id, None)
+                self.job_bindings.pop(account_id, None)
             try:
                 outcome = _job.result()
             except asyncio.CancelledError:
@@ -435,6 +458,7 @@ class TaskScheduler:
 
     async def _run_after_check(
         self,
+        task_id: int,
         account_id: int,
         prewarm: bool,
         check: asyncio.Task | None,
@@ -443,9 +467,11 @@ class TaskScheduler:
             log.info("账号 #%s 启动抢票前取消正在进行的登录检查", account_id)
             check.cancel()
             await asyncio.gather(check, return_exceptions=True)
-        return await self._run_account(account_id, prewarm)
+        return await self._run_binding(task_id, account_id, prewarm)
 
-    async def _run_account(self, account_id: int, prewarm: bool) -> str:
+    async def _run_binding(
+        self, task_id: int, account_id: int, prewarm: bool
+    ) -> str:
         async with self.semaphore:
             log.info(
                 "账号 #%s 获得执行权（%s）",
@@ -455,60 +481,73 @@ class TaskScheduler:
             account = self.db.get_account(account_id)
             if not account:
                 return "账号已不存在"
-            if not account["enabled"]:
-                return "账号未启动"
             if account["status"] != "READY":
-                return f"账号状态为 {account['status']}"
-            task = self.db.get_task(account["task_id"])
+                return "账号登录状态无效"
+            binding = self.db.get_binding(task_id, account_id)
+            if not binding or not binding["enabled"]:
+                return "绑定未启动"
+            if binding["status"] != "READY":
+                return f"绑定状态为 {binding['status']}"
+            task = self.db.get_task(task_id)
             if not task:
                 return "任务已不存在"
             if task["status"] != "active":
                 return f"任务状态为 {task['status']}"
-            plans = self.db.get_account_plans(account_id)
+            plans = self.db.get_binding_plans(task_id, account_id)
             if prewarm:
                 phase = sale_phase(task, plans)
                 if phase == "AVAILABLE":
                     prewarm = False
                 elif phase != "PREWARM":
                     return f"预热阶段已结束（{phase}）"
-            people = self.db.get_audiences(account_id)
-            config = build_order_config(task, plans, people, account, self.system)
-            if not self.db.claim_account(account_id):
-                return "账号状态竞争失败"
+            people = self.db.get_binding_audiences(task_id, account_id)
+            config = build_order_config(
+                task, plans, people, account, binding, self.system
+            )
+            if not self.db.claim_binding(task_id, account_id):
+                return "绑定状态竞争失败"
             try:
-                async with persistent_browser(config.browser) as context:
-                    result = await run_account(
-                        config,
-                        context,
-                        prewarm=prewarm,
-                        trace_label=f"任务 #{task['id']}｜账号 #{account_id}",
-                    )
+                async with self.browsers.use(account_id, config.browser) as context:
+                    try:
+                        result = await run_account(
+                            config,
+                            context,
+                            prewarm=prewarm,
+                            trace_label=f"任务 #{task['id']}｜账号 #{account_id}",
+                        )
+                    finally:
+                        for page in tuple(context.pages):
+                            with suppress(Exception):
+                                await page.close()
             except asyncio.CancelledError:
-                current = self.db.get_account(account_id)
+                current = self.db.get_binding(task_id, account_id)
                 if current:
                     protected = _protected_order_state(config)
                     if protected:
-                        self.db.set_account_status(
+                        self.db.set_binding_status(
+                            task_id,
                             account_id,
                             protected[0],
                             order_id=protected[1],
                             error="执行中断，请人工核对待支付订单",
                         )
                     else:
-                        self.db.set_account_status(
+                        self.db.set_binding_status(
+                            task_id,
                             account_id,
                             "READY" if current["enabled"] else "STOPPED",
                         )
                 raise
             except Exception as exc:
                 log.exception("账号 #%s 抢票执行失败", account_id)
-                current = self.db.get_account(account_id)
+                current = self.db.get_binding(task_id, account_id)
                 result = RunResult("FAILED", str(exc))
                 if current:
                     protected = _protected_order_state(config)
                     if protected:
                         status, order_id = protected
-                        self.db.set_account_status(
+                        self.db.set_binding_status(
+                            task_id,
                             account_id,
                             status,
                             order_id=order_id,
@@ -516,19 +555,21 @@ class TaskScheduler:
                         )
                         result = RunResult(status, str(exc), order_id=order_id)
                     else:
-                        self.db.set_account_status(
+                        self.db.set_binding_status(
+                            task_id,
                             account_id,
                             "READY" if current["enabled"] else "STOPPED",
                             error=str(exc),
                         )
-                self._notify_result(account_id, task, result)
+                self._notify_result(task_id, account_id, task, result)
                 return result.status
             self.db.apply_fulfillment(
+                task_id,
                 account_id,
                 result.fulfilled_quantity,
                 result.removed_audiences,
             )
-            current = self.db.get_account(account_id)
+            current = self.db.get_binding(task_id, account_id)
             if current is None:
                 return "执行完成后账号已不存在"
             next_status = {
@@ -537,7 +578,8 @@ class TaskScheduler:
                 "NEEDS_LOGIN": "NEEDS_LOGIN",
                 "COMPLETE": "COMPLETE",
             }.get(result.status, "READY" if current["enabled"] else "STOPPED")
-            self.db.set_account_status(
+            self.db.set_binding_status(
+                task_id,
                 account_id,
                 next_status,
                 order_id=result.order_id,
@@ -545,8 +587,12 @@ class TaskScheduler:
                 if result.status in {"CREATED", "COMPLETE"}
                 else result.message,
             )
+            if result.status == "NEEDS_LOGIN":
+                self.db.set_account_status(
+                    account_id, "NEEDS_LOGIN", error=result.message
+                )
             if result.status != "RESTOCK":
-                self._notify_result(account_id, task, result)
+                self._notify_result(task_id, account_id, task, result)
             return result.status
 
     def _schedule_login_checks(self, task, remaining: float | None) -> None:
@@ -554,18 +600,24 @@ class TaskScheduler:
             remaining if remaining is not None else float("inf")
         )
         now = time.monotonic()
-        for account in self.db.list_accounts(task["id"]):
-            account_id = int(account["id"])
+        for binding in self.db.list_bindings(task_id=task["id"]):
+            account_id = int(binding["account_id"])
+            account = self.db.get_account(account_id)
+            next_check = self.next_auth.get(account_id, 0)
             if (
-                not account["enabled"]
+                not account
                 or account["status"] != "READY"
+                or not binding["enabled"]
+                or binding["status"] != "READY"
                 or account_id in self.jobs
                 or account_id in self.checks
-                or now < self.next_auth.get(account_id, 0)
+                or now < next_check <= now + interval
             ):
                 continue
             self.next_auth[account_id] = now + interval
-            check = asyncio.create_task(self._check_account_login(account_id, task))
+            check = asyncio.create_task(
+                self._check_account_login(account_id, task, binding)
+            )
             self.checks[account_id] = check
 
             def forget_check(_check: asyncio.Task, aid: int = account_id) -> None:
@@ -574,21 +626,19 @@ class TaskScheduler:
 
             check.add_done_callback(forget_check)
 
-    async def _check_account_login(self, account_id: int, task) -> None:
+    async def _check_account_login(self, account_id: int, task, binding) -> None:
         async with self.semaphore:
             account = self.db.get_account(account_id)
             if (
                 not account
-                or not account["enabled"]
                 or account["status"] != "READY"
+                or not binding["enabled"]
                 or account_id in self.jobs
             ):
                 return
-            plans = self.db.get_account_plans(account_id)
-            people = self.db.get_audiences(account_id)
-            config = build_order_config(task, plans, people, account, self.system)
+            config = build_login_config(task, account, self.system)
             try:
-                async with persistent_browser(config.browser) as context:
+                async with self.browsers.use(account_id, config.browser) as context:
                     valid = await check_login(config, context)
             except Exception as exc:
                 log.warning("账号 #%s 登录检查失败：%s", account_id, exc)
@@ -602,12 +652,14 @@ class TaskScheduler:
                     PendingNotice(
                         f"login:{account_id}",
                         "账号登录已失效",
-                        f"任务 #{task['id']}｜账号 #{account_id}\n发送：登录 {task['id']}",
+                        f"账号 #{account_id}\n发送：登录",
                         "orange",
                     ),
                 )
 
-    def _notify_result(self, account_id: int, task, result: RunResult) -> None:
+    def _notify_result(
+        self, task_id: int, account_id: int, task, result: RunResult
+    ) -> None:
         title = {
             "CREATED": "订单已创建",
             "UNKNOWN": "订单结果未知",
@@ -618,13 +670,14 @@ class TaskScheduler:
         action = {
             "CREATED": (
                 "下一步：在票星球处理待支付订单；"
-                f"如已取消并需继续，发送：重置 {account_id}"
+                f"如已取消并需继续，发送：启动 {task_id} {account_id}"
             ),
             "UNKNOWN": (
-                f"下一步：检查票星球待支付订单；确认无订单后发送：重置 {account_id}"
+                f"下一步：检查票星球待支付订单；确认无订单后发送："
+                f"启动 {task_id} {account_id}"
             ),
-            "NEEDS_LOGIN": f"下一步：登录 {task['id']}",
-            "COMPLETE": f"下一步：配置 {account_id}（设置新的目标数量）",
+            "NEEDS_LOGIN": "下一步：登录",
+            "COMPLETE": f"下一步：绑定 {task_id} {account_id}",
         }.get(result.status, "状态：账号保持启动，将自动继续等待。")
         body = (
             f"任务 #{task['id']}｜账号 #{account_id}\n"
@@ -640,22 +693,43 @@ class TaskScheduler:
             ),
         )
 
-    async def cancel_account(
+    async def cancel_binding(
         self,
+        task_id: int,
         account_id: int,
         *,
         reason: str = "账号操作",
     ) -> None:
-        account = self.db.get_account(account_id)
-        if account:
-            pending = self.pending_notices.get(int(account["task_id"]))
-            if pending:
-                for key in tuple(pending):
-                    if key == f"login:{account_id}" or key.startswith(
-                        f"result:{account_id}:"
-                    ):
-                        pending.pop(key, None)
+        pending = self.pending_notices.get(task_id)
+        if pending:
+            for key in tuple(pending):
+                if key == f"login:{account_id}" or key.startswith(
+                    f"result:{account_id}:"
+                ):
+                    pending.pop(key, None)
+        activities = [
+            activity
+            for activity in (self.jobs.get(account_id),)
+            if self.job_bindings.get(account_id) == (task_id, account_id)
+            if activity
+        ]
+        if activities:
+            log.warning("取消账号 #%s 后台任务：%s", account_id, reason)
+        for activity in activities:
+            activity.cancel()
+        if activities:
+            await asyncio.gather(*activities, return_exceptions=True)
+
+    async def cancel_account(
+        self, account_id: int, *, reason: str = "账号操作"
+    ) -> None:
         self.next_auth.pop(account_id, None)
+        for pending in self.pending_notices.values():
+            for key in tuple(pending):
+                if key == f"login:{account_id}" or key.startswith(
+                    f"result:{account_id}:"
+                ):
+                    pending.pop(key, None)
         activities = [
             activity
             for activity in (self.jobs.get(account_id), self.checks.get(account_id))
@@ -667,16 +741,18 @@ class TaskScheduler:
             activity.cancel()
         if activities:
             await asyncio.gather(*activities, return_exceptions=True)
+        await self.browsers.close(account_id)
 
     async def cancel_task(self, task_id: int, *, reason: str = "任务操作") -> None:
         self.pending_notices.pop(task_id, None)
         await asyncio.gather(
             *(
-                self.cancel_account(
-                    account["id"],
+                self.cancel_binding(
+                    task_id,
+                    binding["account_id"],
                     reason=f"{reason}（任务 #{task_id}）",
                 )
-                for account in self.db.list_accounts(task_id)
+                for binding in self.db.list_bindings(task_id=task_id)
             )
         )
 
@@ -686,6 +762,28 @@ class TaskScheduler:
             activity.cancel()
         if activities:
             await asyncio.gather(*activities, return_exceptions=True)
+        await self.browsers.close_all()
+
+    async def official_audiences(
+        self, task_id: int, account_id: int
+    ) -> tuple[OfficialAudience, ...]:
+        task = self.db.get_task(task_id)
+        account = self.db.get_account(account_id)
+        if not task or not account:
+            raise ValueError("任务或账号不存在")
+        if account["status"] != "READY":
+            raise ValueError("账号登录状态无效")
+        if account_id in self.jobs:
+            raise ValueError("账号正在执行其他任务，请稍后重试")
+        config = build_login_config(task, account, self.system)
+        async with self.browsers.use(account_id, config.browser) as context:
+            page = context.pages[0] if context.pages else await context.new_page()
+            site = PurchasePage(page, config)
+            try:
+                return await AuthGuard(site).audiences()
+            finally:
+                with suppress(Exception):
+                    await page.close()
 
 
 def _protected_order_state(
