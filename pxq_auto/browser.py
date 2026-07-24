@@ -4,11 +4,52 @@ import os
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from pathlib import Path
+import time
 
-from playwright.async_api import BrowserContext, Error, Playwright, async_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Error,
+    Page,
+    Playwright,
+    async_playwright,
+)
 
 from .config import BrowserConfig
+
+
+MAX_WARM_PAGES_PER_ACCOUNT = 2
+
+
+@dataclass
+class WarmTaskPage:
+    page: Page
+    auth_headers: dict[str, str] = field(default_factory=dict)
+    last_used: float = field(default_factory=time.monotonic)
+    pages: set[Page] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.pages.add(self.page)
+
+    def adopt(self, page: Page) -> None:
+        self.page = page
+        self.pages.add(page)
+        self.last_used = time.monotonic()
+
+
+async def blank_page(context: BrowserContext, claimed: set[Page] | None = None) -> Page:
+    claimed = claimed or set()
+    return next(
+        (
+            page
+            for page in context.pages
+            if page not in claimed
+            and not page.is_closed()
+            and page.url == "about:blank"
+        ),
+        None,
+    ) or await context.new_page()
 
 
 @asynccontextmanager
@@ -24,7 +65,7 @@ async def persistent_browser(
             headless=config.headless,
             viewport={"width": 430, "height": 900},
             screen={"width": 430, "height": 900},
-            device_scale_factor=2,
+            device_scale_factor=1,
             has_touch=True,
             is_mobile=True,
             user_agent=(
@@ -63,6 +104,7 @@ class AccountBrowserPool:
         self._locks: dict[int, asyncio.Lock] = {}
         self._managers: dict[int, AbstractAsyncContextManager[BrowserContext]] = {}
         self._contexts: dict[int, BrowserContext] = {}
+        self._pages: dict[tuple[int, int], WarmTaskPage] = {}
 
     @asynccontextmanager
     async def use(
@@ -82,21 +124,79 @@ class AccountBrowserPool:
                 if "closed" in str(exc).lower():
                     closed_manager = self._managers.pop(account_id, None)
                     self._contexts.pop(account_id, None)
+                    self._forget_pages(account_id)
                     if closed_manager is not None:
                         await closed_manager.__aexit__(None, None, None)
                 raise
+
+    async def task_page(
+        self,
+        account_id: int,
+        task_id: int,
+        context: BrowserContext,
+    ) -> WarmTaskPage:
+        for page_key, item in tuple(self._pages.items()):
+            if page_key[0] == account_id and item.page.is_closed():
+                self._pages.pop(page_key, None)
+                await self._close_pages(item)
+        key = (account_id, task_id)
+        warm = self._pages.get(key)
+        if warm is not None:
+            warm.last_used = time.monotonic()
+            return warm
+
+        account_pages = [
+            (page_key, item)
+            for page_key, item in self._pages.items()
+            if page_key[0] == account_id
+        ]
+        if len(account_pages) >= MAX_WARM_PAGES_PER_ACCOUNT:
+            old_key, old = min(account_pages, key=lambda pair: pair[1].last_used)
+            self._pages.pop(old_key, None)
+            await self._close_pages(old)
+
+        claimed = {
+            page
+            for item in self._pages.values()
+            for page in item.pages
+            if not page.is_closed()
+        }
+        page = await blank_page(context, claimed)
+        warm = WarmTaskPage(page)
+        self._pages[key] = warm
+        return warm
+
+    async def close_task_page(self, account_id: int, task_id: int) -> None:
+        lock = self._locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            warm = self._pages.pop((account_id, task_id), None)
+            if warm is not None:
+                await self._close_pages(warm)
 
     async def close(self, account_id: int) -> None:
         lock = self._locks.setdefault(account_id, asyncio.Lock())
         async with lock:
             manager = self._managers.pop(account_id, None)
             self._contexts.pop(account_id, None)
+            self._forget_pages(account_id)
             if manager is not None:
                 await manager.__aexit__(None, None, None)
 
     async def close_all(self) -> None:
         for account_id in tuple(self._managers):
             await self.close(account_id)
+
+    def _forget_pages(self, account_id: int) -> None:
+        for key in tuple(self._pages):
+            if key[0] == account_id:
+                self._pages.pop(key, None)
+
+    @staticmethod
+    async def _close_pages(warm: WarmTaskPage) -> None:
+        for page in tuple(warm.pages):
+            if not page.is_closed():
+                with suppress(Error):
+                    await page.close()
 
 
 async def save_screenshot(page, directory: Path, name: str) -> Path:

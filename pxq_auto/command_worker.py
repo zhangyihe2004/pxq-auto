@@ -482,6 +482,7 @@ class CommandWorker:
         await self.scheduler.cancel_binding(task_id, account_id)
         if not self.db.deactivate_binding(task_id, account_id):
             return "绑定不存在。"
+        await self.scheduler.release_account_if_idle(account_id)
         return f"任务 #{task_id}｜账号 #{account_id} 已停止；配置和登录资料已保留。"
 
     async def _detach(self, parts: list[str]) -> str:

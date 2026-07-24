@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import math
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -27,6 +28,9 @@ FAST_STOCK_WINDOW_SECONDS = 5.0
 STOCK_POLL_SECONDS = 1.0
 STOCK_WAIT_SECONDS = 60.0
 STATIC_UNAVAILABLE_CODE = "22024036"
+STATIC_LAYOUT_CACHE_SIZE = 16
+STATIC_RETRY_CACHE_SIZE = 64
+DECODED_RESOURCE_CACHE_SIZE = 64
 T = TypeVar("T")
 
 
@@ -44,12 +48,31 @@ class StaticLayout:
     plan_zones: dict[str, frozenset[str]]
 
 
-_STATIC_LAYOUTS: dict[str, StaticLayout] = {}
+_STATIC_LAYOUTS: OrderedDict[str, StaticLayout] = OrderedDict()
 _STATIC_LOADS: dict[str, asyncio.Task[StaticLayout]] = {}
-_STATIC_RETRY_AT: dict[str, float] = {}
-_DECODED_RESOURCES: dict[str, tuple[Seat, ...]] = {}
+_STATIC_RETRY_AT: OrderedDict[str, float] = OrderedDict()
+_DECODED_RESOURCES: OrderedDict[str, tuple[Seat, ...]] = OrderedDict()
 _DECODE_LOADS: dict[str, asyncio.Task[tuple[Seat, ...]]] = {}
 _DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+
+def _cache_get(cache: OrderedDict[str, T], key: str) -> T | None:
+    value = cache.pop(key, None)
+    if value is not None:
+        cache[key] = value
+    return value
+
+
+def _cache_put(
+    cache: OrderedDict[str, T],
+    key: str,
+    value: T,
+    limit: int,
+) -> None:
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > limit:
+        cache.popitem(last=False)
 
 
 @dataclass(frozen=True)
@@ -227,7 +250,7 @@ async def _wait_static_layout(
     remaining_seconds: float,
 ) -> StaticLayout:
     key = url.partition("?")[0]
-    if layout := _STATIC_LAYOUTS.get(key):
+    if layout := _cache_get(_STATIC_LAYOUTS, key):
         return layout
     loop = asyncio.get_running_loop()
     sale_at = loop.time() + remaining_seconds
@@ -236,16 +259,22 @@ async def _wait_static_layout(
         now = loop.time()
         if now >= deadline:
             raise StaticInventoryUnavailable("静态座位资源尚未下发")
-        if (retry_at := _STATIC_RETRY_AT.get(key, 0.0)) > now:
+        if (retry_at := _cache_get(_STATIC_RETRY_AT, key) or 0.0) > now:
             await asyncio.sleep(min(retry_at, deadline) - now)
             continue
         try:
             return await _load_static_layout(site, url)
         except StaticInventoryUnavailable:
             remaining = sale_at - loop.time()
-            _STATIC_RETRY_AT[key] = loop.time() + min(
-                presale_poll_interval(remaining),
-                deadline - loop.time(),
+            _cache_put(
+                _STATIC_RETRY_AT,
+                key,
+                loop.time()
+                + min(
+                    presale_poll_interval(remaining),
+                    deadline - loop.time(),
+                ),
+                STATIC_RETRY_CACHE_SIZE,
             )
 
 
@@ -494,7 +523,7 @@ async def _load_static_layout(
     url: str,
 ) -> StaticLayout:
     key = url.partition("?")[0]
-    if layout := _STATIC_LAYOUTS.get(key):
+    if layout := _cache_get(_STATIC_LAYOUTS, key):
         return layout
     task = _STATIC_LOADS.get(key)
     if task is None:
@@ -505,7 +534,7 @@ async def _load_static_layout(
     finally:
         if task.done() and _STATIC_LOADS.get(key) is task:
             _STATIC_LOADS.pop(key, None)
-    _STATIC_LAYOUTS[key] = layout
+    _cache_put(_STATIC_LAYOUTS, key, layout, STATIC_LAYOUT_CACHE_SIZE)
     _STATIC_RETRY_AT.pop(key, None)
     return layout
 
@@ -556,7 +585,7 @@ async def _decode_zones(
         url = resources.get(zone_id)
         if not url:
             raise RuntimeError(f"静态座位资源缺少区域 {zone_id}")
-        seats = _DECODED_RESOURCES.get(url)
+        seats = _cache_get(_DECODED_RESOURCES, url)
         if seats is None:
             task = _DECODE_LOADS.get(url)
             if task is None:
@@ -567,7 +596,12 @@ async def _decode_zones(
             finally:
                 if task.done() and _DECODE_LOADS.get(url) is task:
                     _DECODE_LOADS.pop(url, None)
-            _DECODED_RESOURCES[url] = seats
+            _cache_put(
+                _DECODED_RESOURCES,
+                url,
+                seats,
+                DECODED_RESOURCE_CACHE_SIZE,
+            )
         return zone_id, seats
 
     return dict(await asyncio.gather(*(decode(zone_id) for zone_id in zone_ids)))

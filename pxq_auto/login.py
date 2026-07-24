@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from playwright.async_api import Locator, Page, Response
 
 from .auth import AuthGuard, AuthenticationRequired
-from .browser import persistent_browser
+from .browser import blank_page, persistent_browser
 from .config import (
     SystemConfig,
     build_login_config,
@@ -187,7 +187,7 @@ class FeishuLoginManager:
         manager = persistent_browser(config.browser)
         context = await manager.__aenter__()
         session.context_manager = manager
-        page = context.pages[0] if context.pages else await context.new_page()
+        page = await blank_page(context)
         session.page = page
         site = PurchasePage(page, config)
         await site.open_purchase()
