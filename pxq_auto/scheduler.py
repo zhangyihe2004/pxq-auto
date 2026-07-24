@@ -678,7 +678,7 @@ class TaskScheduler:
             ),
             "NEEDS_LOGIN": "下一步：登录",
             "COMPLETE": f"下一步：绑定 {task_id} {account_id}",
-        }.get(result.status, "状态：账号保持启动，将自动继续等待。")
+        }.get(result.status, "状态：该绑定保持启动，将自动继续等待。")
         body = (
             f"任务 #{task['id']}｜账号 #{account_id}\n"
             f"**{task['show_name']}**\n{result.message}\n{action}\n操作：未支付"
@@ -703,9 +703,7 @@ class TaskScheduler:
         pending = self.pending_notices.get(task_id)
         if pending:
             for key in tuple(pending):
-                if key == f"login:{account_id}" or key.startswith(
-                    f"result:{account_id}:"
-                ):
+                if key.startswith(f"result:{account_id}:"):
                     pending.pop(key, None)
         activities = [
             activity
@@ -719,6 +717,12 @@ class TaskScheduler:
             activity.cancel()
         if activities:
             await asyncio.gather(*activities, return_exceptions=True)
+
+    async def release_account_if_idle(self, account_id: int) -> None:
+        if not self.db.list_bindings(account_id=account_id):
+            for pending in self.pending_notices.values():
+                pending.pop(f"login:{account_id}", None)
+            await self.browsers.close(account_id)
 
     async def cancel_account(
         self, account_id: int, *, reason: str = "账号操作"
@@ -744,6 +748,7 @@ class TaskScheduler:
         await self.browsers.close(account_id)
 
     async def cancel_task(self, task_id: int, *, reason: str = "任务操作") -> None:
+        self._move_login_notices(task_id)
         self.pending_notices.pop(task_id, None)
         await asyncio.gather(
             *(
@@ -755,6 +760,28 @@ class TaskScheduler:
                 for binding in self.db.list_bindings(task_id=task_id)
             )
         )
+        self._clear_runtime_state(task_id)
+
+    def _move_login_notices(self, task_id: int) -> None:
+        pending = self.pending_notices.get(task_id)
+        if not pending:
+            return
+        for key, notice in tuple(pending.items()):
+            if not key.startswith("login:"):
+                continue
+            account_id = int(key.partition(":")[2])
+            target = next(
+                (
+                    int(binding["task_id"])
+                    for binding in self.db.list_bindings(account_id=account_id)
+                    if int(binding["task_id"]) != task_id
+                    and (task := self.db.get_task(binding["task_id"]))
+                    and task["status"] == "active"
+                ),
+                None,
+            )
+            if target is not None:
+                self.pending_notices.setdefault(target, {})[key] = notice
 
     async def close(self) -> None:
         activities = [*self.jobs.values(), *self.checks.values()]

@@ -74,7 +74,9 @@ class FeishuLoginManager:
         tasks = self.db.list_tasks()
         if not tasks:
             return "当前没有抢票任务，请先搜索并创建任务。"
-        task_id = int(tasks[0]["id"])
+        task_id = int(
+            next((task for task in tasks if task["status"] == "active"), tasks[0])["id"]
+        )
         if command.sender_open_id in self.sessions:
             return "你已有登录流程进行中；发送“取消”后才能重新开始。"
         self.sessions[command.sender_open_id] = LoginSession(
@@ -320,9 +322,12 @@ class FeishuLoginManager:
             with suppress(Exception):
                 await manager.__aexit__(None, None, None)
         if release and session.account_id is not None:
-            key = self.db.delete_account(session.account_id)
-            if key:
-                remove_account_home(key)
+            account = self.db.get_account(session.account_id)
+            if account:
+                await asyncio.to_thread(
+                    remove_account_home, str(account["profile_key"])
+                )
+                self.db.delete_account(session.account_id)
 
 
 async def _wait_unique(locator: Locator, label: str) -> Locator:

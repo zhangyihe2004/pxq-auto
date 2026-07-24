@@ -29,7 +29,7 @@ class SessionUnavailable(RuntimeError):
     pass
 
 
-def parse_numbers(value: str, upper: int) -> list[int]:
+def parse_numbers(value: str, upper: int, label: str = "票档") -> list[int]:
     try:
         numbers = list(
             dict.fromkeys(
@@ -39,9 +39,9 @@ def parse_numbers(value: str, upper: int) -> list[int]:
             )
         )
     except ValueError as exc:
-        raise ValueError("票档编号必须用逗号分隔，如 1,3") from exc
+        raise ValueError(f"{label}编号必须用逗号分隔，如 1,3") from exc
     if not numbers or any(number < 1 or number > upper for number in numbers):
-        raise ValueError(f"票档编号必须在 1~{upper} 之间")
+        raise ValueError(f"{label}编号必须在 1~{upper} 之间")
     return numbers
 
 

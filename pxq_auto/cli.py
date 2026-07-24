@@ -17,6 +17,7 @@ from .config import (
     CONFIG_PATH,
     DB_PATH,
     build_login_config,
+    build_order_config,
     load_system_config,
 )
 from .db import Database
@@ -153,16 +154,50 @@ def _recover_bindings(db: Database, system) -> None:
             )
             continue
         if state and state.status in {"SUBMITTING", "CREATED", "UNKNOWN"}:
-            status = "UNKNOWN" if state.status == "SUBMITTING" else state.status
+            if binding["status"] not in {"CREATED", "UNKNOWN"}:
+                try:
+                    config = build_order_config(
+                        task,
+                        db.get_binding_plans(task["id"], account["id"]),
+                        db.get_binding_audiences(task["id"], account["id"]),
+                        account,
+                        binding,
+                        system,
+                    )
+                    state = PersistentOrderGuard(
+                        config.state_path, config.plan_key
+                    ).current()
+                except (RuntimeError, ValueError):
+                    db.set_binding_status(
+                        task["id"],
+                        account["id"],
+                        "UNKNOWN",
+                        error="订单保护文件属于旧配置，请人工核对",
+                    )
+                    continue
+            protected_status = (
+                "UNKNOWN" if state.status == "SUBMITTING" else state.status
+            )
             db.set_binding_status(
                 task["id"],
                 account["id"],
-                status,
+                protected_status,
                 order_id=state.order_id,
-                error="服务在创建订单时中断，请人工核对" if status == "UNKNOWN" else "",
+                error=(
+                    "服务在创建订单时中断，请人工核对"
+                    if protected_status == "UNKNOWN"
+                    else ""
+                ),
             )
         elif binding["status"] == "RUNNING":
-            db.set_binding_status(task["id"], account["id"], "STOPPED")
+            recovered_status = (
+                "READY"
+                if binding["enabled"] and account["status"] == "READY"
+                else "NEEDS_LOGIN"
+                if binding["enabled"]
+                else "STOPPED"
+            )
+            db.set_binding_status(task["id"], account["id"], recovered_status)
 
 
 async def _test_feishu() -> None:

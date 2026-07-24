@@ -79,6 +79,7 @@ class CommandWorker:
             db,
             scheduler.cancel_binding,
             scheduler.official_audiences,
+            self._clear_order_state,
             self._reply,
         )
         self.searches: dict[tuple[str, str], tuple[float, list[dict]]] = {}
@@ -276,7 +277,7 @@ class CommandWorker:
             f"数量：每个账号 1~{int(session['limitation'])} 张\n"
             f"间隔：{interval} 秒{adjusted}\n"
             "账号：0\n状态：等待添加账号\n\n"
-            "下一步：登录"
+            f"{self._account_next_step(task_id)}"
         )
 
     def _tasks(self) -> str:
@@ -287,15 +288,20 @@ class CommandWorker:
         for task in tasks:
             bindings = self.db.list_bindings(task_id=task["id"])
             enabled = sum(bool(binding["enabled"]) for binding in bindings)
+            runnable = sum(
+                bool(binding["enabled"])
+                and binding["status"] in {"READY", "RUNNING"}
+                for binding in bindings
+            )
             block = (
                 f"任务 #{task['id']}｜{'运行中' if task['status'] == 'active' else '已暂停'}\n"
                 f"演出：{task['show_name']}\n"
                 f"场次：{task['session_name']}\n"
-                f"账号：{len(bindings)}（已启动 {enabled}）\n"
+                f"账号：{len(bindings)}（已启用 {enabled}｜可运行 {runnable}）\n"
                 f"间隔：{task['interval_sec']} 秒"
             )
             if not bindings:
-                block += "\n下一步：登录；然后绑定任务与账号"
+                block += f"\n{self._account_next_step(task['id'])}"
             blocks.append(block)
         return f"抢票任务（{len(tasks)}）\n\n" + "\n\n".join(blocks)
 
@@ -366,11 +372,11 @@ class CommandWorker:
                     f"  {index}. {person['name']}｜{person['masked_id']}"
                     for index, person in enumerate(people, 1)
                 )
-            if not binding["enabled"]:
-                lines.append(f"下一步：启动 {task_id} {account['id']}")
+            if next_step := _binding_next_step(task_id, account["id"], binding):
+                lines.append(next_step)
             lines.append("")
         if not bindings:
-            lines.append("下一步：登录；然后绑定 <任务ID> <账号ID>")
+            lines.append(self._account_next_step(task_id))
         elif lines[-1] == "":
             lines.pop()
         return "\n".join(lines)
@@ -380,11 +386,26 @@ class CommandWorker:
             return f"发送：{name} <任务ID>"
         task_id = int(parts[1])
         if name == "删除":
-            if not self.db.get_task(task_id):
+            task = self.db.get_task(task_id)
+            if not task:
                 return f"任务 #{task_id} 不存在。"
+            accounts = [
+                account
+                for binding in self.db.list_bindings(task_id=task_id)
+                if (account := self.db.get_account(binding["account_id"]))
+            ]
+            state_paths = [
+                build_login_config(task, account, self.scheduler.system).state_path
+                for account in accounts
+            ]
             self.configurator.cancel_task_sessions(task_id)
             await self.scheduler.cancel_task(task_id)
-            self.db.delete_task(task_id)
+            if not self.db.delete_task(task_id):
+                return f"任务 #{task_id} 不存在。"
+            for path in state_paths:
+                PersistentOrderGuard.clear(path)
+            for account in accounts:
+                await self.scheduler.release_account_if_idle(int(account["id"]))
             return f"已删除任务 #{task_id}；账号及登录资料已保留。"
         status = "paused" if name == "暂停" else "active"
         if not self.db.set_task_status(task_id, status):
@@ -479,6 +500,7 @@ class CommandWorker:
         PersistentOrderGuard.clear(
             build_login_config(task, account, self.scheduler.system).state_path
         )
+        await self.scheduler.release_account_if_idle(account_id)
         return f"任务 #{task_id} 已解绑账号 #{account_id}；账号和登录资料已保留。"
 
     def _accounts(self) -> str:
@@ -507,20 +529,62 @@ class CommandWorker:
         if len(parts) != 2 or not parts[1].isdigit():
             return "发送：删除账号 <账号ID>"
         account_id = int(parts[1])
+        account = self.db.get_account(account_id)
+        if not account:
+            return f"账号 #{account_id} 不存在。"
+        self.db.set_account_status(account_id, "NEEDS_LOGIN")
         self.configurator.cancel_account_sessions(account_id)
         await self.scheduler.cancel_account(account_id)
         await self.login.cancel_account(account_id)
-        key = self.db.delete_account(account_id)
-        if not key:
-            return f"账号 #{account_id} 不存在。"
-        remove_account_home(key)
+        await asyncio.to_thread(remove_account_home, str(account["profile_key"]))
+        if not self.db.delete_account(account_id):
+            raise RuntimeError(f"账号 #{account_id} 本地资料已删除，但数据库删除失败")
         return f"账号 #{account_id} 及其全部绑定和本地登录资料已删除。"
+
+    def _clear_order_state(self, task_id: int, account_id: int) -> None:
+        task = self.db.get_task(task_id)
+        account = self.db.get_account(account_id)
+        if task and account:
+            PersistentOrderGuard.clear(
+                build_login_config(task, account, self.scheduler.system).state_path
+            )
+
+    def _account_next_step(self, task_id: int) -> str:
+        ready_accounts = [
+            account
+            for account in self.db.list_accounts()
+            if account["status"] == "READY"
+        ]
+        if not ready_accounts:
+            return "下一步：登录"
+        return f"下一步：绑定 {task_id} <账号ID>；发送“账号”查看编号"
 
 
 def _binding_ids(parts: list[str], command: str) -> tuple[int, int] | str:
     if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
         return f"发送：{command} <任务ID> <账号ID>"
     return int(parts[1]), int(parts[2])
+
+
+def _binding_next_step(task_id: int, account_id: int, binding) -> str:
+    status = binding["status"]
+    if status == "CREATED":
+        return (
+            "下一步：在票星球处理待支付订单；"
+            f"如已取消并需继续，发送：启动 {task_id} {account_id}"
+        )
+    if status == "UNKNOWN":
+        return (
+            "下一步：检查票星球待支付订单；确认无订单后发送："
+            f"启动 {task_id} {account_id}"
+        )
+    if status == "COMPLETE":
+        return f"下一步：重新配置观演人，发送：绑定 {task_id} {account_id}"
+    if status == "NEEDS_LOGIN":
+        return "下一步：登录"
+    if not binding["enabled"]:
+        return f"下一步：启动 {task_id} {account_id}"
+    return ""
 
 
 def _mode(task, phase: str) -> str:

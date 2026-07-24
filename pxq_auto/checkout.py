@@ -545,7 +545,9 @@ async def _save_failure(
     site: PurchasePage, config: AccountRunConfig, name: str
 ) -> None:
     with suppress(Exception):
-        directory = config.browser.profile_dir.parent / "artifacts"
+        directory = (
+            config.browser.profile_dir.parent / "artifacts" / config.state_path.stem
+        )
         await save_screenshot(site.page, directory, name)
 
 

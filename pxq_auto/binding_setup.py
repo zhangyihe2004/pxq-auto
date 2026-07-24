@@ -45,11 +45,13 @@ class BindingSetupFlow:
         load_audiences: Callable[
             [int, int], Awaitable[tuple[OfficialAudience, ...]]
         ],
+        clear_order_state: Callable[[int, int], None],
         reply: Callable[[str, str], Awaitable[None]],
     ) -> None:
         self.db = db
         self.cancel_binding = cancel_binding
         self.load_audiences = load_audiences
+        self.clear_order_state = clear_order_state
         self.reply = reply
         self.sessions: dict[str, BindingSetupSession] = {}
         self.binding_owners: dict[BindingKey, str] = {}
@@ -113,7 +115,7 @@ class BindingSetupFlow:
         text = command.text.strip()
         if text == "取消":
             self._drop(session)
-            return "绑定配置已取消；原配置不变，绑定保持停止。"
+            return "绑定配置已取消；原配置不变，绑定不会自动启动。"
         if session.phase == "PLANS":
             return self._consume_plans(session, text)
         if session.phase == "QUANTITY":
@@ -177,13 +179,17 @@ class BindingSetupFlow:
             )
         except Exception as exc:
             self._drop(session)
-            return f"读取账号 #{session.account_id} 的官方观演人失败：{exc}\n绑定未修改。"
+            return (
+                f"读取账号 #{session.account_id} 的官方观演人失败：{exc}\n"
+                "原配置未修改；绑定不会自动启动。"
+            )
         if len(session.official_people) < required:
             self._drop(session)
             return (
                 f"票星球账号只有 {len(session.official_people)} 位可用观演人，"
                 f"当前需要 {required} 位。\n"
                 "请先在票星球添加或修正观演人，再重新发送绑定指令。"
+                "\n原配置未修改；绑定不会自动启动。"
             )
         if len(session.official_people) == required:
             session.people = [
@@ -197,7 +203,7 @@ class BindingSetupFlow:
     def _consume_people(self, session: BindingSetupSession, text: str) -> str:
         required = self._required_people(session)
         try:
-            numbers = parse_numbers(text, len(session.official_people))
+            numbers = parse_numbers(text, len(session.official_people), "观演人")
         except ValueError as exc:
             return self._people_prompt(session, str(exc))
         if len(numbers) != required:
@@ -221,6 +227,7 @@ class BindingSetupFlow:
                 session.quantity,
                 session.people,
             )
+            self.clear_order_state(session.task_id, session.account_id)
         except ValueError as exc:
             return self._confirm_prompt(session, f"无法保存：{exc}")
         summary = self._summary(session)
