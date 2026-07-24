@@ -4,7 +4,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .config import profile_key
+from .config import profile_key, required_audience_count
 
 
 _UNCHANGED = object()
@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT NOT NULL,
     session_name TEXT NOT NULL,
     support_seat_picking INTEGER NOT NULL,
+    show_limit INTEGER NOT NULL DEFAULT 0,
+    session_limitation INTEGER NOT NULL DEFAULT 1,
+    real_name_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
     interval_sec INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     session_status TEXT NOT NULL DEFAULT '',
@@ -33,6 +36,8 @@ CREATE TABLE IF NOT EXISTS task_plans (
     plan_name TEXT NOT NULL,
     price REAL NOT NULL,
     limitation INTEGER NOT NULL,
+    unit_qty INTEGER NOT NULL DEFAULT 1,
+    has_combo INTEGER NOT NULL DEFAULT 0,
     priority INTEGER NOT NULL,
     can_buy_count INTEGER NOT NULL DEFAULT 0,
     sale_started INTEGER NOT NULL DEFAULT 0,
@@ -46,6 +51,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     phone TEXT NOT NULL UNIQUE,
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     profile_key TEXT NOT NULL UNIQUE,
+    quantity INTEGER NOT NULL DEFAULT 1,
     enabled INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'RESERVED',
     order_id TEXT,
@@ -82,6 +88,52 @@ class Database:
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 15000")
         self.connection.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        additions = {
+            "tasks": (
+                ("show_limit", "INTEGER NOT NULL DEFAULT 0"),
+                ("session_limitation", "INTEGER NOT NULL DEFAULT 1"),
+                ("real_name_mode", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+            ),
+            "task_plans": (
+                ("unit_qty", "INTEGER NOT NULL DEFAULT 1"),
+                ("has_combo", "INTEGER NOT NULL DEFAULT 0"),
+            ),
+            "accounts": (("quantity", "INTEGER NOT NULL DEFAULT 1"),),
+        }
+        added: set[tuple[str, str]] = set()
+        for table, columns in additions.items():
+            known = {
+                row["name"]
+                for row in self.connection.execute(f"PRAGMA table_info({table})")
+            }
+            for name, definition in columns:
+                if name not in known:
+                    self.connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
+                    added.add((table, name))
+        if ("accounts", "quantity") in added:
+            self.connection.execute(
+                """
+                UPDATE accounts
+                SET quantity = MAX(1, (
+                    SELECT COUNT(*) FROM audiences WHERE account_id = accounts.id
+                ))
+                """
+            )
+        if ("tasks", "session_limitation") in added:
+            self.connection.execute(
+                """
+                UPDATE tasks
+                SET session_limitation = MAX(1, COALESCE((
+                    SELECT MAX(limitation) FROM task_plans
+                    WHERE task_id = tasks.id
+                ), 1))
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -124,6 +176,9 @@ class Database:
         session_id: str,
         session_name: str,
         support_seat_picking: bool,
+        show_limit: int,
+        session_limitation: int,
+        real_name_mode: str,
         interval_sec: int,
         session_status: str,
         sale_time_ms: int | None,
@@ -144,9 +199,10 @@ class Database:
                 """
                 INSERT INTO tasks (
                     id, show_id, show_name, session_id, session_name,
-                    support_seat_picking, interval_sec, session_status,
-                    sale_time_ms, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    support_seat_picking, show_limit, session_limitation,
+                    real_name_mode, interval_sec, session_status, sale_time_ms,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -155,6 +211,9 @@ class Database:
                     session_id,
                     session_name,
                     int(support_seat_picking),
+                    show_limit,
+                    session_limitation,
+                    real_name_mode,
                     interval_sec,
                     session_status,
                     sale_time_ms,
@@ -166,8 +225,8 @@ class Database:
                 """
                 INSERT INTO task_plans (
                     task_id, seat_plan_id, plan_name, price, limitation, priority,
-                    can_buy_count, sale_started, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    unit_qty, has_combo, can_buy_count, sale_started, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -177,6 +236,8 @@ class Database:
                         plan["price"],
                         int(plan.get("limitation") or 0),
                         priority,
+                        max(1, int(plan.get("unit_qty") or 1)),
+                        int(bool(plan.get("has_combo"))),
                         int(plan.get("can_buy_count") or 0),
                         int(bool(plan.get("sale_started"))),
                         now,
@@ -386,11 +447,16 @@ class Database:
             if account["status"] in {"CREATED", "UNKNOWN"}:
                 raise ValueError("账号存在订单保护状态")
             if account["status"] == "COMPLETE":
-                raise ValueError("原观演人均已购买")
-            if not self.get_account_plans(account_id) or not self.get_audiences(
-                account_id
-            ):
+                raise ValueError("原目标数量已完成")
+            task = self.get_task(account["task_id"])
+            if not task or not self.get_account_plans(account_id):
                 raise ValueError("账号配置不完整")
+            people = self.get_audiences(account_id)
+            required = required_audience_count(
+                task["real_name_mode"], int(account["quantity"])
+            )
+            if len(people) != required:
+                raise ValueError("账号观演人配置不完整")
             self.connection.execute(
                 """
                 UPDATE accounts
@@ -448,17 +514,6 @@ class Database:
             ).rowcount
         )
 
-    def remove_audiences(self, account_id: int, masked_ids: tuple[str, ...]) -> None:
-        if not masked_ids:
-            return
-        placeholders = ",".join("?" for _ in masked_ids)
-        with self.connection:
-            self.connection.execute(
-                f"DELETE FROM audiences WHERE account_id = ? "
-                f"AND masked_id IN ({placeholders})",
-                (account_id, *masked_ids),
-            )
-
     def get_audiences(self, account_id: int) -> list[sqlite3.Row]:
         return self.connection.execute(
             "SELECT * FROM audiences WHERE account_id = ? ORDER BY position",
@@ -469,13 +524,12 @@ class Database:
         self,
         account_id: int,
         plan_ids: list[str],
+        quantity: int,
         people: list[tuple[str, str]],
     ) -> None:
         """校验并以一个事务同时替换票档、观演人和运行状态。"""
         if not plan_ids or len(plan_ids) != len(set(plan_ids)):
             raise ValueError("至少选择一个不重复的票档")
-        if not people:
-            raise ValueError("至少添加一位观演人")
         masked_ids = [masked_id for _, masked_id in people]
         if len(masked_ids) != len(set(masked_ids)):
             raise ValueError("同一证件不能重复添加")
@@ -487,27 +541,37 @@ class Database:
                 raise ValueError(f"账号 #{account_id} 不存在")
             if account["status"] in {"RUNNING", "CREATED", "UNKNOWN"}:
                 raise ValueError("账号当前状态不允许修改配置")
+            task = self.get_task(account["task_id"])
+            if not task:
+                raise ValueError("账号所属任务不存在")
+            maximum = max(1, int(task["session_limitation"]))
+            if not 1 <= quantity <= maximum:
+                raise ValueError(f"购票数量必须在 1~{maximum} 之间")
+            required = required_audience_count(task["real_name_mode"], quantity)
+            if len(people) != required:
+                raise ValueError(f"当前实名规则需要配置 {required} 位观演人")
             known = {
                 row["seat_plan_id"] for row in self.get_task_plans(account["task_id"])
             }
             if not set(plan_ids) <= known:
                 raise ValueError("票档包含其他场次或已失效的编号")
-            placeholders = ",".join("?" for _ in masked_ids)
-            conflict = self.connection.execute(
-                f"""
-                SELECT a.id, u.masked_id
-                FROM audiences u
-                JOIN accounts a ON a.id = u.account_id
-                WHERE a.task_id = ? AND a.id != ?
-                  AND u.masked_id IN ({placeholders})
-                LIMIT 1
-                """,
-                (account["task_id"], account_id, *masked_ids),
-            ).fetchone()
-            if conflict:
-                raise ValueError(
-                    f"证件 {conflict['masked_id']} 已配置在同场次账号 #{conflict['id']}"
-                )
+            if masked_ids:
+                placeholders = ",".join("?" for _ in masked_ids)
+                conflict = self.connection.execute(
+                    f"""
+                    SELECT a.id, u.masked_id
+                    FROM audiences u
+                    JOIN accounts a ON a.id = u.account_id
+                    WHERE a.task_id = ? AND a.id != ?
+                      AND u.masked_id IN ({placeholders})
+                    LIMIT 1
+                    """,
+                    (account["task_id"], account_id, *masked_ids),
+                ).fetchone()
+                if conflict:
+                    raise ValueError(
+                        f"证件 {conflict['masked_id']} 已配置在同场次账号 #{conflict['id']}"
+                    )
             self.connection.execute(
                 "DELETE FROM account_plans WHERE account_id = ?", (account_id,)
             )
@@ -531,11 +595,41 @@ class Database:
             self.connection.execute(
                 """
                 UPDATE accounts
-                SET enabled = 0, status = 'STOPPED', order_id = NULL,
+                SET quantity = ?, enabled = 0, status = 'STOPPED', order_id = NULL,
                     last_error = '', updated_at = ?
                 WHERE id = ?
                 """,
-                (time.time(), account_id),
+                (quantity, time.time(), account_id),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def apply_fulfillment(
+        self,
+        account_id: int,
+        quantity: int,
+        masked_ids: tuple[str, ...],
+    ) -> None:
+        if quantity <= 0 and not masked_ids:
+            return
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            if masked_ids:
+                placeholders = ",".join("?" for _ in masked_ids)
+                self.connection.execute(
+                    f"DELETE FROM audiences WHERE account_id = ? "
+                    f"AND masked_id IN ({placeholders})",
+                    (account_id, *masked_ids),
+                )
+            self.connection.execute(
+                """
+                UPDATE accounts
+                SET quantity = MAX(0, quantity - ?), updated_at = ?
+                WHERE id = ?
+                """,
+                (max(0, quantity), time.time(), account_id),
             )
             self.connection.commit()
         except Exception:

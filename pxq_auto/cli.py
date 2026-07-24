@@ -11,15 +11,15 @@ from pathlib import Path
 import httpx
 
 from . import __version__
-from .api import PxqClient, PxqError
-from .commands import CommandWorker
+from .public_api import PxqClient, PxqError
+from .command_worker import CommandWorker
 from .config import CONFIG_PATH, DB_PATH, account_home, load_system_config
 from .db import Database
-from .engine import AutoEngine
+from .scheduler import TaskScheduler
 from .feishu import FeishuError, FeishuGateway, IncomingCommand
-from .guard import PersistentOrderGuard
+from .order_guard import PersistentOrderGuard
 from .login import FeishuLoginManager
-from .service import TaskService
+from .task_service import TaskService
 
 
 def main() -> None:
@@ -68,11 +68,11 @@ async def _serve() -> None:
     queue: asyncio.Queue[IncomingCommand] = asyncio.Queue(maxsize=100)
     feishu = FeishuGateway(system.raw, queue)
     service = TaskService(db, client)
-    engine = AutoEngine(db, service, feishu, system)
-    login = FeishuLoginManager(db, feishu, system, engine.cancel_account)
-    worker = CommandWorker(queue, db, service, engine, login, feishu)
+    scheduler = TaskScheduler(db, service, feishu, system)
+    login = FeishuLoginManager(db, feishu, system, scheduler.cancel_account)
+    worker = CommandWorker(queue, db, service, scheduler, login, feishu)
     tasks = [
-        asyncio.create_task(engine.run_forever()),
+        asyncio.create_task(scheduler.run_forever()),
         asyncio.create_task(feishu.run_forever()),
         asyncio.create_task(login.run_forever()),
         asyncio.create_task(worker.run_forever()),
@@ -87,7 +87,7 @@ async def _serve() -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await engine.close()
+        await scheduler.close()
         await login.close()
         await feishu.aclose()
         await client.aclose()

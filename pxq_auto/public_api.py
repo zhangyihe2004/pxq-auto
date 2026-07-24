@@ -1,8 +1,8 @@
-"""票星球公开接口客户端。"""
+"""票星球公开查询接口客户端。"""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeGuard
 
 import httpx
 
@@ -11,6 +11,10 @@ USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
 )
+
+
+def is_success_payload(payload: object) -> TypeGuard[dict[str, Any]]:
+    return isinstance(payload, dict) and str(payload.get("statusCode")) == "200"
 
 
 class PxqError(RuntimeError):
@@ -101,6 +105,10 @@ class PxqClient:
     async def show_dynamic(self, show_id: str) -> dict:
         """演出动态信息：包含官方开售时间与演出状态。"""
         return await self._get_object(f"/show/pub/v5/show/{show_id}/dynamic")
+
+    async def show_static(self, show_id: str) -> dict:
+        """演出静态信息：包含购票须知与实名规则。"""
+        return await self._get_object(f"/show/pub/v5/show/{show_id}/static")
 
     async def quick_order_plans(self, show_id: str, session_id: str) -> dict:
         """快速购票票档：名称、价格、实时可买数和限购数。"""

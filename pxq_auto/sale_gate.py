@@ -1,3 +1,5 @@
+"""官方销售状态、服务端时间与开售放行。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,20 +12,20 @@ from urllib.parse import urlencode
 from playwright.async_api import APIResponse
 
 from .auth import AuthGuard, request_context
-from .service import (
+from .public_api import is_success_payload
+from .sale_state import (
+    INTENSIVE_SECONDS,
     OPEN_SESSION_STATUSES,
     POST_SALE_WAIT_SECONDS,
     PREWARM_SECONDS,
-    _find_session,
-    _sale_time,
-    _session_sale_time,
+    find_session,
+    presale_poll_interval,
+    sale_time,
+    session_sale_time,
 )
-from .site import PiaoxingqiuPage, is_success_payload
+from .purchase_page import PurchasePage
 
 
-INTENSIVE_SECONDS = 5
-STATUS_POLL_SECONDS = 0.25
-WARM_POLL_SECONDS = 1.0
 FAR_POLL_SECONDS = 30.0
 
 
@@ -49,7 +51,7 @@ class SaleState:
 
 
 class SaleGate:
-    def __init__(self, site: PiaoxingqiuPage) -> None:
+    def __init__(self, site: PurchasePage) -> None:
         self.site = site
         self.show_id = site.show_id
         _, self.session_id = site.booking_ids
@@ -63,7 +65,7 @@ class SaleGate:
 
     async def fetch(self) -> SaleState:
         payloads, now_ms = await self._fetch_payloads((self.show_url, self.session_url))
-        session = _find_session(payloads[1], self.session_id)
+        session = find_session(payloads[1], self.session_id)
         if session is None:
             raise RuntimeError("开售状态接口未找到 booking_url 对应的目标场次")
         session_status = str(session.get("sessionStatus") or "").upper()
@@ -71,14 +73,14 @@ class SaleGate:
             raise RuntimeError("目标场次缺少 sessionStatus")
         return SaleState(
             session_status=session_status,
-            sale_time_ms=_sale_time(session)
-            or _session_sale_time(payloads[0], self.session_id),
+            sale_time_ms=sale_time(session)
+            or session_sale_time(payloads[0], self.session_id),
             server_time_ms=now_ms,
         )
 
     async def _refresh_session(self, previous: SaleState) -> SaleState:
         payloads, now_ms = await self._fetch_payloads((self.session_url,))
-        session = _find_session(payloads[0], self.session_id)
+        session = find_session(payloads[0], self.session_id)
         if session is None:
             raise RuntimeError("场次状态轮询未找到目标场次")
         session_status = str(session.get("sessionStatus") or "").upper()
@@ -86,7 +88,7 @@ class SaleGate:
             raise RuntimeError("目标场次缺少 sessionStatus")
         return SaleState(
             session_status=session_status,
-            sale_time_ms=_sale_time(session) or previous.sale_time_ms,
+            sale_time_ms=sale_time(session) or previous.sale_time_ms,
             server_time_ms=now_ms,
         )
 
@@ -169,12 +171,7 @@ class SaleGate:
             elif not final_auth and now >= next_auth:
                 await auth.require_valid(allow_refresh=True)
                 next_auth = now + 10
-            delay = (
-                STATUS_POLL_SECONDS
-                if remaining <= INTENSIVE_SECONDS
-                else min(WARM_POLL_SECONDS, remaining - INTENSIVE_SECONDS)
-            )
-            await asyncio.sleep(max(STATUS_POLL_SECONDS, delay))
+            await asyncio.sleep(presale_poll_interval(remaining))
 
     @staticmethod
     def _check_response(response: APIResponse) -> None:

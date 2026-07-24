@@ -1,4 +1,4 @@
-"""通知接口与飞书消息卡片构建。"""
+"""飞书消息卡片构建。"""
 
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+"""飞书指令消费、路由与回复。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,20 +7,23 @@ import shlex
 import time
 
 from .config import account_home, mask_phone, remove_account_home
-from .configuration import AccountConfigurator
+from .account_setup import AccountSetupFlow
 from .db import Database
-from .engine import AutoEngine
+from .scheduler import TaskScheduler
 from .feishu import FeishuGateway, IncomingCommand
-from .guard import PersistentOrderGuard
+from .order_guard import PersistentOrderGuard
 from .login import FeishuLoginManager
-from .messages import next_step, status_label
-from .service import MIN_INTERVAL, TaskService, sale_phase
+from .account_guidance import next_step, status_label
+from .sale_state import MIN_INTERVAL, sale_phase
+from .task_service import TaskService, real_name_label
 
 
 SEARCH_TTL = 900
 REPLY_RETRY_SECONDS = 10
 MAX_PENDING_REPLIES = 100
 HELP = """票星球自动抢票
+
+流程：搜索 → 抢票 → 登录 → 配置 → 启动
 
 【创建】
 搜索 <关键词>
@@ -49,21 +54,21 @@ class CommandWorker:
         queue: asyncio.Queue[IncomingCommand],
         db: Database,
         service: TaskService,
-        engine: AutoEngine,
+        scheduler: TaskScheduler,
         login: FeishuLoginManager,
         feishu: FeishuGateway,
     ) -> None:
         self.queue = queue
         self.db = db
         self.service = service
-        self.engine = engine
+        self.scheduler = scheduler
         self.login = login
         self.feishu = feishu
         self.pending_replies: dict[str, str] = {}
         login.reply = self._reply
-        self.configurator = AccountConfigurator(
+        self.configurator = AccountSetupFlow(
             db,
-            engine.cancel_account,
+            scheduler.cancel_account,
             self._reply,
         )
         self.searches: dict[tuple[str, str], tuple[float, list[dict]]] = {}
@@ -172,12 +177,13 @@ class CommandWorker:
                     f"{index}. {show.get('showName', '')}",
                     f"时间：{show.get('showDate') or '未知'}",
                     f"地点：{show.get('cityName', '')} {show.get('venueName', '')}".strip(),
+                    f"实名：{real_name_label(show.get('_real_name_mode', 'UNKNOWN'))}",
                 )
             )
         lines.extend(("", "发送：抢票 <搜索序号>"))
         return "\n".join(lines)
 
-    def _search_show_id(self, command: IncomingCommand, value: str) -> str | None:
+    def _search_show(self, command: IncomingCommand, value: str) -> dict | None:
         if not value.isdigit():
             return None
         cached = self.searches.get(self._key(command))
@@ -188,16 +194,17 @@ class CommandWorker:
             return None
         index = int(value)
         if 1 <= index <= len(cached[1]):
-            return str(cached[1][index - 1].get("showId") or "") or None
+            return cached[1][index - 1]
         return None
 
     async def _create(self, command: IncomingCommand, parts: list[str]) -> str:
         usage = "发送：抢票 <搜索序号> [间隔 <秒>]"
         if len(parts) < 2:
             return usage
-        show_id = self._search_show_id(command, parts[1])
-        if not show_id:
+        show = self._search_show(command, parts[1])
+        if not show:
             return "搜索序号无效或结果已过期，请重新搜索。"
+        show_id = str(show.get("showId") or "")
         options = {"场次": "", "间隔": "60"}
         interval_given = False
         index = 2
@@ -239,6 +246,7 @@ class CommandWorker:
             session=session,
             plans=plans,
             interval=interval,
+            real_name_mode=str(show.get("_real_name_mode") or "UNKNOWN"),
         )
         if not created:
             return f"该场次已经是任务 #{task_id}，不会重复创建。\n发送：详情 {task_id}"
@@ -252,6 +260,8 @@ class CommandWorker:
             f"演出：{show_name}\n"
             f"场次：{session.get('sessionName', '')}\n"
             f"方式：{'选座' if session.get('supportSeatPicking') else '不选座'}\n"
+            f"实名：{real_name_label(show.get('_real_name_mode', 'UNKNOWN'))}\n"
+            f"数量：每个账号 1~{int(session['limitation'])} 张\n"
             f"间隔：{interval} 秒{adjusted}\n"
             "账号：0\n状态：等待添加账号\n\n"
             f"下一步：登录 {task_id}"
@@ -292,6 +302,9 @@ class CommandWorker:
             f"演出：{task['show_name']}",
             f"场次：{task['session_name']}",
             f"方式：{'选座' if task['support_seat_picking'] else '不选座'}",
+            f"实名：{real_name_label(task['real_name_mode'])}",
+            f"场次限购：{task['session_limitation']} 张",
+            f"项目累计限购：{task['show_limit'] or '未提供'}",
             f"状态：{_mode(task, phase)}",
             f"间隔：{task['interval_sec']} 秒",
             "",
@@ -301,13 +314,16 @@ class CommandWorker:
             stock = (
                 "未开售"
                 if phase in {"SCHEDULED", "PREWARM", "WAITING"}
-                else f"有票 {plan['can_buy_count']} 张"
+                else f"最多可买 {plan['can_buy_count'] * plan['unit_qty']} 张"
                 if plan["sale_started"] and plan["can_buy_count"] > 0
                 else "可售但无票"
                 if plan["sale_started"]
                 else "未开售"
             )
-            lines.append(f"{number}. {plan['plan_name']}｜¥{plan['price']:g}｜{stock}")
+            lines.append(
+                f"{number}. {plan['plan_name']}｜¥{plan['price']:g}"
+                f"{'｜支持套票优惠' if plan['has_combo'] else ''}｜{stock}"
+            )
         lines.extend(("", f"账号（{len(accounts)}）："))
         for account in accounts:
             account_plans = self.db.get_account_plans(account["id"])
@@ -321,13 +337,19 @@ class CommandWorker:
                         if account_plans
                         else "未配置"
                     ),
-                    f"观演人（{len(people)}）：",
+                    f"数量：{account['quantity']} 张",
+                    (
+                        "观演人：无需配置"
+                        if task["real_name_mode"] == "NONE"
+                        else f"观演人（{len(people)}）："
+                    ),
                 )
             )
-            lines.extend(
-                f"  {index}. {person['name']}｜{person['masked_id']}"
-                for index, person in enumerate(people, 1)
-            )
+            if people:
+                lines.extend(
+                    f"  {index}. {person['name']}｜{person['masked_id']}"
+                    for index, person in enumerate(people, 1)
+                )
             if step := next_step(self.db, account["id"]):
                 lines.append(step)
             lines.append("")
@@ -345,7 +367,7 @@ class CommandWorker:
             if not self.db.get_task(task_id):
                 return f"任务 #{task_id} 不存在。"
             self.configurator.cancel_task_sessions(task_id)
-            await self.engine.cancel_task(task_id)
+            await self.scheduler.cancel_task(task_id)
             for account in self.db.list_accounts(task_id):
                 await self.login.cancel_account(account["id"])
             keys = self.db.delete_task(task_id)
@@ -356,9 +378,9 @@ class CommandWorker:
         if not self.db.set_task_status(task_id, status):
             return f"任务 #{task_id} 不存在。"
         if status == "paused":
-            await self.engine.cancel_task(task_id)
+            await self.scheduler.cancel_task(task_id)
         else:
-            self.engine.next_poll[task_id] = 0
+            self.scheduler.next_poll[task_id] = 0
         return f"已{name}任务 #{task_id}。"
 
     def _interval(self, parts: list[str]) -> str:
@@ -373,7 +395,7 @@ class CommandWorker:
         requested = int(parts[2])
         interval = max(MIN_INTERVAL, requested)
         self.db.set_task_interval(task_id, interval)
-        self.engine.next_poll[task_id] = 0
+        self.scheduler.next_poll[task_id] = 0
         adjusted = "（已按最低值调整）" if requested < MIN_INTERVAL else ""
         return f"任务 #{task_id} 间隔已改为 {interval} 秒{adjusted}。"
 
@@ -408,10 +430,10 @@ class CommandWorker:
         except ValueError as exc:
             step = next_step(self.db, account_id)
             return f"{exc}。\n{step}" if step else f"{exc}。"
-        self.engine.next_poll[account["task_id"]] = 0
+        self.scheduler.next_poll[account["task_id"]] = 0
         task = self.db.get_task(account["task_id"])
         assert task is not None
-        if not self.engine.system.create_order_enabled:
+        if not self.scheduler.system.create_order_enabled:
             result = "系统当前禁止创建订单，只会继续监控。"
         elif task["status"] == "paused":
             result = f"账号已启用，但任务已暂停。发送：恢复 {task['id']}"
@@ -427,7 +449,7 @@ class CommandWorker:
         if not account:
             return f"账号 #{account_id} 不存在。"
         self.configurator.cancel_account_session(account_id)
-        await self.engine.cancel_account(account_id)
+        await self.scheduler.cancel_account(account_id)
         self.db.deactivate_account(account_id)
         account = self.db.get_account(account_id)
         assert account is not None
@@ -443,7 +465,7 @@ class CommandWorker:
             return "发送：解绑 <账号ID>"
         account_id = int(parts[1])
         self.configurator.cancel_account_session(account_id)
-        await self.engine.cancel_account(account_id)
+        await self.scheduler.cancel_account(account_id)
         await self.login.cancel_account(account_id)
         key = self.db.delete_account(account_id)
         if not key:
@@ -459,7 +481,7 @@ class CommandWorker:
         if not account:
             return f"账号 #{account_id} 不存在。"
         self.configurator.cancel_account_session(account_id)
-        await self.engine.cancel_account(account_id, reason="重置订单保护")
+        await self.scheduler.cancel_account(account_id, reason="重置订单保护")
         account = self.db.get_account(account_id)
         if not account:
             return f"账号 #{account_id} 已不存在。"
@@ -467,15 +489,10 @@ class CommandWorker:
             account_home(account["profile_key"]) / "order-state.json"
         )
         self.db.set_account_status(account_id, "STOPPED", order_id=None)
-        people = self.db.get_audiences(account_id)
-        next_action = (
-            f"启动 {account_id}"
-            if people
-            else f"配置 {account_id}（观演人已全部移出待抢名单）"
-        )
+        next_action = next_step(self.db, account_id)
         return (
             f"账号 #{account_id} 的订单保护已重置。\n"
-            f"状态：已停止\n下一步：{next_action}"
+            f"状态：已停止\n{next_action}"
         )
 
 

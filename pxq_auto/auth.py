@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 from playwright.async_api import Request
 
-from .site import PiaoxingqiuPage
+if TYPE_CHECKING:
+    from .purchase_page import PurchasePage
 
 
 class AuthenticationError(RuntimeError):
@@ -20,11 +21,10 @@ class AuthenticationRequired(AuthenticationError):
 class AuthGuard:
     def __init__(
         self,
-        site: PiaoxingqiuPage,
+        site: PurchasePage,
     ) -> None:
         self.site = site
         self.headers: dict[str, str] = {}
-        self.show_user_data: dict[str, Any] = {}
         self._verified_at = 0.0
         root = f"{site.origin}/cyy_gatewayapi/show"
         self.endpoint = f"{root}/buyer/v5/show/{site.show_id}/show_user"
@@ -64,7 +64,6 @@ class AuthGuard:
             f"{self.endpoint}?{query}", headers=self.headers
         )
         if response.status in {401, 403}:
-            self.show_user_data = {}
             self._verified_at = 0.0
             return False
         if response.status in {429, 469}:
@@ -77,11 +76,8 @@ class AuthGuard:
         if not isinstance(payload, dict):
             raise AuthenticationError("登录检查响应不是 JSON 对象")
         if str(payload.get("statusCode")) != "200":
-            self.show_user_data = {}
             self._verified_at = 0.0
             return False
-        data = payload.get("data")
-        self.show_user_data = data if isinstance(data, dict) else {}
         self._verified_at = asyncio.get_running_loop().time()
         return True
 
@@ -107,7 +103,7 @@ def request_context(headers: dict[str, str] | None = None) -> dict[str, str]:
     }
 
 
-async def capture_authenticated_headers(site: PiaoxingqiuPage) -> dict[str, str]:
+async def capture_authenticated_headers(site: PurchasePage) -> dict[str, str]:
     loop = asyncio.get_running_loop()
     future: asyncio.Future[Request] = loop.create_future()
 
