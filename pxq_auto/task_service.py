@@ -1,22 +1,27 @@
+"""抢票任务创建、刷新与展示数据处理。"""
+
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Awaitable
 from typing import Any
 
-from .api import PxqClient
+from .public_api import PxqClient
 from .db import Database
+from .sale_state import (
+    MIN_INTERVAL,
+    MISSING_SESSION_STATUS,
+    sale_time,
+    session_sale_time,
+)
 
 
-MIN_INTERVAL = 10
-PREWARM_SECONDS = 60
-POST_SALE_WAIT_SECONDS = 60
-MISSING_SESSION_STATUS = "MISSING"
-OPEN_SESSION_STATUSES = {"ON_SALE", "PRE_SALE"}
-ACTIVE_SESSION_STATUSES = OPEN_SESSION_STATUSES | {
-    "LACK_OF_TICKET",
-    "PENDING",
+REAL_NAME_KEY = "REAL_NAME_PURCHASE_TICKET_INTRODUCTION"
+REAL_NAME_LABELS = {
+    "NONE": "无需实名",
+    "PER_ORDER": "一单一证",
+    "PER_TICKET": "一票一证",
+    "UNKNOWN": "实名规则未识别",
 }
 
 
@@ -40,24 +45,55 @@ def parse_numbers(value: str, upper: int) -> list[int]:
     return numbers
 
 
-def sale_phase(task, plans, now_ms: int | None = None) -> str:
-    """Return the internal phase derived from the official sessionStatus."""
-    status = str(task["session_status"] or "").upper()
-    if status in OPEN_SESSION_STATUSES:
-        return (
-            "AVAILABLE"
-            if any(plan["sale_started"] and plan["can_buy_count"] > 0 for plan in plans)
-            else "RESTOCK"
-        )
-    if status == "LACK_OF_TICKET":
-        return "RESTOCK"
-    if status == "PENDING" and task["sale_time_ms"] is not None:
-        current_ms = int(time.time() * 1000) if now_ms is None else now_ms
-        remaining = (task["sale_time_ms"] - current_ms) / 1000
-        if remaining > PREWARM_SECONDS:
-            return "SCHEDULED"
-        return "PREWARM" if remaining >= -POST_SALE_WAIT_SECONDS else "RESTOCK"
-    return "WAITING"
+def parse_real_name_mode(payload: dict[str, Any]) -> str:
+    instructions = payload.get("descInfo", {}).get("ticketInstructions", [])
+    item = next(
+        (
+            entry
+            for entry in instructions
+            if isinstance(entry, dict) and entry.get("key") == REAL_NAME_KEY
+        ),
+        None,
+    )
+    value = str(item.get("value") or "") if item else ""
+    if "无需实名" in value:
+        return "NONE"
+    if "一单一证" in value:
+        return "PER_ORDER"
+    if "一票一证" in value:
+        return "PER_TICKET"
+    return "UNKNOWN"
+
+
+def logical_plans(payload: dict[str, Any]) -> list[dict]:
+    raw = payload.get("seatPlans")
+    if not isinstance(raw, list):
+        raise ValueError("票档接口未返回 seatPlans")
+    combo_bases = {
+        str(component.get("bizSeatPlanId") or "")
+        for item in raw
+        if isinstance(item, dict)
+        and (item.get("isCombo") or item.get("seatPlanCategory") == "FREE_COMBO")
+        for component in item.get("items", [])
+        if isinstance(component, dict) and component.get("bizSeatPlanId")
+    }
+    return [
+        {
+            "pid": item["seatPlanId"],
+            "plan_name": str(item.get("seatPlanName") or item["seatPlanId"]),
+            "price": float(item.get("originalPrice") or 0),
+            "can_buy_count": int(item.get("canBuyCount") or 0),
+            "limitation": int(item.get("limitation") or 0),
+            "unit_qty": max(1, int(item.get("unitQty") or 1)),
+            "has_combo": str(item["seatPlanId"]) in combo_bases,
+            "sale_started": bool(item.get("saleStarted")),
+        }
+        for item in raw
+        if isinstance(item, dict)
+        and item.get("seatPlanId")
+        and not item.get("isCombo")
+        and item.get("seatPlanCategory") != "FREE_COMBO"
+    ]
 
 
 class TaskService:
@@ -66,7 +102,22 @@ class TaskService:
         self.client = client
 
     async def search(self, keyword: str) -> list[dict]:
-        return await self.client.search_shows(keyword)
+        shows = await self.client.search_shows(keyword)
+        modes = await asyncio.gather(
+            *(
+                self.real_name_mode(str(show.get("showId") or ""))
+                for show in shows
+            ),
+            return_exceptions=True,
+        )
+        for show, mode in zip(shows, modes):
+            show["_real_name_mode"] = mode if isinstance(mode, str) else "UNKNOWN"
+        return shows
+
+    async def real_name_mode(self, show_id: str) -> str:
+        if not show_id:
+            return "UNKNOWN"
+        return parse_real_name_mode(await self.client.show_static(show_id))
 
     async def show_sessions(self, show_id: str) -> tuple[str, list[dict]]:
         sessions, dynamic = await asyncio.gather(
@@ -74,26 +125,15 @@ class TaskService:
             self.client.show_dynamic(show_id),
         )
         for session in sessions:
-            if sale_time := _session_sale_time(
+            if session_time := session_sale_time(
                 dynamic, str(session.get("bizShowSessionId") or "")
-            ) or _sale_time(session):
-                session["_sale_time_ms"] = sale_time
+            ) or sale_time(session):
+                session["_sale_time_ms"] = session_time
         show_name = str(sessions[0].get("showName") or show_id) if sessions else show_id
         return show_name, sessions
 
     async def plans(self, show_id: str, session_id: str) -> list[dict]:
-        payload = await self.client.quick_order_plans(show_id, session_id)
-        return [
-            {
-                "pid": item["seatPlanId"],
-                "plan_name": str(item.get("seatPlanName") or item["seatPlanId"]),
-                "price": float(item.get("originalPrice") or 0),
-                "can_buy_count": int(item.get("canBuyCount") or 0),
-                "limitation": int(item.get("limitation") or 0),
-                "sale_started": bool(item.get("saleStarted")),
-            }
-            for item in payload["seatPlans"]
-        ]
+        return logical_plans(await self.client.quick_order_plans(show_id, session_id))
 
     def create_task(
         self,
@@ -103,25 +143,31 @@ class TaskService:
         session: dict,
         plans: list[dict],
         interval: int,
+        real_name_mode: str,
     ) -> tuple[int, bool]:
         session_id = str(session["bizShowSessionId"])
         if not plans:
             raise ValueError("该场次当前没有票档")
+        session_limitation = int(session.get("limitation") or 0)
+        if session_limitation < 1:
+            raise ValueError("官方未返回有效的场次限购数量")
         task_id, created = self.db.create_task(
             show_id=show_id,
             show_name=show_name,
             session_id=session_id,
             session_name=str(session.get("sessionName") or session_id),
             support_seat_picking=bool(session.get("supportSeatPicking")),
+            show_limit=int(session.get("showLimit") or 0),
+            session_limitation=session_limitation,
+            real_name_mode=real_name_mode,
             interval_sec=max(MIN_INTERVAL, interval),
             session_status=str(
                 session.get("sessionStatus") or MISSING_SESSION_STATUS
             ).upper(),
-            sale_time_ms=session.get("_sale_time_ms") or _sale_time(session),
+            sale_time_ms=session.get("_sale_time_ms") or sale_time(session),
             plans=plans,
         )
         return task_id, created
-
     async def refresh_task(
         self,
         task,
@@ -148,9 +194,9 @@ class TaskService:
             session_status = str(
                 session.get("sessionStatus") or MISSING_SESSION_STATUS
             ).upper()
-            sale_time_ms = _sale_time(session)
+            sale_time_ms = sale_time(session)
             if session_status == "PENDING" and sale_time_ms is None:
-                sale_time_ms = _session_sale_time(
+                sale_time_ms = session_sale_time(
                     await self.client.show_dynamic(show_id), session_id
                 )
             plans = await plans_task
@@ -173,52 +219,5 @@ class TaskService:
         )
 
 
-def _sale_time(value: Any) -> int | None:
-    candidates = {
-        int(item)
-        for item in _walk(value)
-        if isinstance(item, (int, float)) and item > 1_000_000_000_000
-    }
-    return candidates.pop() if len(candidates) == 1 else None
-
-
-def _session_sale_time(value: Any, session_id: str) -> int | None:
-    matches = [item for item in _walk_dicts(value) if _session_id(item) == session_id]
-    return _sale_time(matches)
-
-
-def _find_session(value: Any, session_id: str) -> dict[str, Any] | None:
-    return next(
-        (item for item in _walk_dicts(value) if _session_id(item) == session_id),
-        None,
-    )
-
-
-def _session_id(value: dict[str, Any]) -> str:
-    return str(value.get("bizShowSessionId") or "")
-
-
-def _walk(value: Any):
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in {
-                "sessionSaleTime",
-                "saleTime",
-                "saleStartTime",
-                "startSaleTime",
-            }:
-                yield item
-            yield from _walk(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk(item)
-
-
-def _walk_dicts(value: Any):
-    if isinstance(value, dict):
-        yield value
-        for item in value.values():
-            yield from _walk_dicts(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_dicts(item)
+def real_name_label(mode: str) -> str:
+    return REAL_NAME_LABELS.get(mode, REAL_NAME_LABELS["UNKNOWN"])

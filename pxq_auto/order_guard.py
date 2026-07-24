@@ -1,3 +1,5 @@
+"""创建订单状态保护与网络放行控制。"""
+
 from __future__ import annotations
 
 import json
@@ -12,12 +14,9 @@ from playwright.async_api import Request, Route
 
 
 GuardStatus = Literal["READY", "SUBMITTING", "CREATED", "UNKNOWN"]
-CREATE_PATHS = frozenset(
-    {
-        "/cyy_gatewayapi/trade/buyer/v1/items/orders/submit",
-        "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order",
-    }
-)
+GENERAL_CREATE_PATH = "/cyy_gatewayapi/trade/buyer/v1/items/orders/submit"
+CART_CREATE_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order"
+CREATE_PATHS = frozenset({GENERAL_CREATE_PATH, CART_CREATE_PATH})
 
 
 def is_create_url(url: str) -> bool:

@@ -5,8 +5,8 @@ from itertools import groupby
 
 from playwright.async_api import Locator
 
-from .inventory import Candidate, SeatSelection
-from .site import PiaoxingqiuPage
+from .seat_selection import Candidate, SeatSelection
+from .purchase_page import PurchasePage
 
 
 FIND_VENUE_MAP_JS = """() => {
@@ -76,86 +76,60 @@ LOAD_ZONE_JS = (
     if (!enabledZoneCodes.length) throw new Error('目标看台当前不可售');
 
     const box = venueMap.venueBoxSelf;
-    const map = box.mapbox;
+    if (typeof venueMap.clickSeatFeature !== 'function' ||
+        typeof venueMap.seatInCart !== 'function') {
+        throw new Error('票星球官方选座方法不可用');
+    }
     const enabled = properties => properties.enable === true ||
         properties.enable === 'true' || properties.enable === 1 ||
         properties.enable === '1';
-    const view = {
-        center: [target.x, target.y],
-        zoom: Math.min(
-            box.strategy.maxZoom,
-            box.strategy.getSeatMinZoom() + 0.01,
-        ),
-    };
     for (const code of enabledZoneCodes) box._cachedZoneCodes?.delete(code);
     if (box.seatData?.features) {
         box.seatData.features = box.seatData.features.filter(
             feature => feature.properties?.zoneConcreteId !== target.zoneId
         );
     }
-    venueMap.isRefreshing = true;
-    await bounded(new Promise((resolve, reject) => {
-        Promise.resolve(box.loadSeatsInZoneCodes(enabledZoneCodes, resolve)).catch(reject);
-    }), '加载目标看台数据超时');
     const globals = document.getElementById('app')?._vnode?.appContext?.config
         ?.globalProperties;
-    globals?.$loading?.().hide();
-    let targetFeatures;
-    do {
-        targetFeatures = (box.seatData?.features || []).filter(
-            feature => feature.properties?.zoneConcreteId === target.zoneId
-        );
-        if (targetFeatures.some(feature => {
-            const properties = feature.properties || {};
-            return enabled(properties) && properties.seatConcreteId === target.seatId &&
-                properties.seatPlanId === target.planId;
-        })) break;
-        await frame('等待目标座位数据超时');
-    } while (true);
-    await frame('等待目标座位绘制超时');
-    const source = map.getSource('venueMapRowSeatDataSource');
-    if (typeof source?.setData !== 'function') {
-        throw new Error('未找到票星球座位数据源');
-    }
-    const seats = target.seats || [];
-    const selectedBefore = document.querySelectorAll('.seat-item').length;
-    for (const [index, seat] of seats.entries()) {
-        let point;
+    let features;
+    venueMap.isRefreshing = true;
+    try {
+        await bounded(new Promise((resolve, reject) => {
+            Promise.resolve(
+                box.loadSeatsInZoneCodes(enabledZoneCodes, resolve)
+            ).catch(reject);
+        }), '加载目标看台数据超时');
         do {
-            if (index === 0) {
-                map.stop();
-                map.jumpTo(view);
-                source.setData({type: 'FeatureCollection', features: targetFeatures});
-                map.triggerRepaint();
-            }
-            await frame('等待目标座位渲染超时');
-            point = map.project([seat.x, seat.y]);
-            const feature = map.queryRenderedFeatures([point.x, point.y]).find(item => {
-                const properties = item.properties || {};
-                return enabled(properties) && properties.seatConcreteId === seat.seatId &&
+            const zoneFeatures = (box.seatData?.features || []).filter(
+                feature => feature.properties?.zoneConcreteId === target.zoneId
+            );
+            features = target.seats.map(seat => zoneFeatures.find(feature => {
+                const properties = feature.properties || {};
+                return enabled(properties) &&
+                    properties.seatConcreteId === seat.seatId &&
                     properties.zoneConcreteId === seat.zoneId &&
                     properties.seatPlanId === seat.planId;
-            });
-            if (feature) break;
+            }));
+            if (features.every(Boolean)) break;
+            await frame('等待目标座位数据超时');
         } while (true);
+    } finally {
+        venueMap.isRefreshing = false;
+        globals?.$loading?.().hide();
+    }
 
-        const rect = map.getCanvas().getBoundingClientRect();
-        map.fire('click', {
-            point,
-            lngLat: map.unproject([point.x, point.y]),
-            originalEvent: new MouseEvent('click', {
-                bubbles: true,
-                cancelable: true,
-                clientX: rect.left + point.x,
-                clientY: rect.top + point.y,
-            }),
-        });
-        while (document.querySelectorAll('.seat-item').length <
-               selectedBefore + index + 1) {
+    for (const feature of features) {
+        if (!venueMap.seatInCart(feature)) {
+            await bounded(
+                venueMap.clickSeatFeature(feature),
+                '票星球官方选座处理超时',
+            );
+        }
+        while (!venueMap.canClickSeat || !venueMap.seatInCart(feature)) {
             await frame('等待座位选中状态超时');
         }
     }
-    return targetFeatures.length;
+    return features.length;
 }"""
 )
 
@@ -194,17 +168,25 @@ RESET_SELECTION_JS = (
 )
 
 
-async def select_seats(
-    site: PiaoxingqiuPage,
+async def select_ready_seats(
+    site: PurchasePage,
     selection: SeatSelection,
-    *,
-    open_map: bool = True,
 ) -> Locator:
-    if open_map:
-        candidate = selection.candidates[0]
-        await site._open_seat_map(candidate.plan_id, candidate.plan)
-    else:
-        await _reset_selection(site)
+    return await _select_seats(site, selection)
+
+
+async def reselect_seats(
+    site: PurchasePage,
+    selection: SeatSelection,
+) -> Locator:
+    await _reset_selection(site)
+    return await _select_seats(site, selection)
+
+
+async def _select_seats(
+    site: PurchasePage,
+    selection: SeatSelection,
+) -> Locator:
     for _, grouped in groupby(
         selection.candidates,
         key=lambda candidate: candidate.seat.zone_id,
@@ -212,7 +194,7 @@ async def select_seats(
         candidates = tuple(grouped)
         await _load_zone(site, candidates)
 
-    confirm = await site._poll(lambda: site._enabled_exact("确认选座"))
+    confirm = await site.wait_confirm_seat()
     if confirm is None:
         raise RuntimeError(
             f"点击 {len(selection.candidates)} 个目标座位后等待“确认选座”启用超时"
@@ -220,7 +202,7 @@ async def select_seats(
     return confirm
 
 
-async def _reset_selection(site: PiaoxingqiuPage) -> None:
+async def _reset_selection(site: PurchasePage) -> None:
     try:
         await asyncio.wait_for(
             site.page.evaluate(
@@ -234,7 +216,7 @@ async def _reset_selection(site: PiaoxingqiuPage) -> None:
 
 
 async def _load_zone(
-    site: PiaoxingqiuPage,
+    site: PurchasePage,
     candidates: tuple[Candidate, ...],
 ) -> None:
     candidate = candidates[0]
@@ -244,10 +226,6 @@ async def _load_zone(
                 LOAD_ZONE_JS,
                 {
                     "zoneId": candidate.seat.zone_id,
-                    "seatId": candidate.seat.seat_id,
-                    "planId": candidate.plan_id,
-                    "x": candidate.seat.x,
-                    "y": candidate.seat.y,
                     "timeoutMs": max(250, site.config.browser.timeout_ms - 250),
                     "seats": [_seat_target(item) for item in candidates],
                 },
@@ -262,10 +240,8 @@ async def _load_zone(
         raise RuntimeError(f"目标看台“{candidate.seat.zone_name}”没有返回座位数据")
 
 
-def _seat_target(candidate: Candidate) -> dict[str, str | float]:
+def _seat_target(candidate: Candidate) -> dict[str, str]:
     return {
-        "x": candidate.seat.x,
-        "y": candidate.seat.y,
         "zoneId": candidate.seat.zone_id,
         "seatId": candidate.seat.seat_id,
         "planId": candidate.plan_id,

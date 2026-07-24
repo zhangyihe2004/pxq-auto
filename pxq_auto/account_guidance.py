@@ -1,5 +1,8 @@
+"""账号状态标签与下一步操作提示。"""
+
 from __future__ import annotations
 
+from .config import required_audience_count
 from .db import Database
 
 
@@ -11,7 +14,7 @@ STATUS_LABELS = {
     "NEEDS_LOGIN": "登录已失效",
     "CREATED": "订单已创建",
     "UNKNOWN": "订单结果未知",
-    "COMPLETE": "观演人均已购",
+    "COMPLETE": "目标数量已完成",
 }
 
 
@@ -31,12 +34,22 @@ def next_step(db: Database, account_id: int) -> str:
         return f"下一步：处理待支付订单；如已取消并需继续，发送：重置 {account_id}"
     if status == "UNKNOWN":
         return f"下一步：检查待支付订单；确认无订单后发送：重置 {account_id}"
-    if not db.get_account_plans(account_id) or not db.get_audiences(account_id):
+    if status == "COMPLETE":
+        return f"下一步：配置 {account_id}（设置新的目标数量）"
+    people = db.get_audiences(account_id)
+    required = (
+        required_audience_count(task["real_name_mode"], int(account["quantity"]))
+        if task
+        else -1
+    )
+    if (
+        not db.get_account_plans(account_id)
+        or account["quantity"] < 1
+        or len(people) != required
+    ):
         return f"下一步：配置 {account_id}"
     if status == "STOPPED":
         return f"下一步：启动 {account_id}"
     if status == "READY" and task and task["status"] == "paused":
         return f"账号已启用；任务暂停中，发送：恢复 {task['id']}"
-    if status == "COMPLETE":
-        return f"下一步：配置 {account_id}（更换观演人）"
     return ""

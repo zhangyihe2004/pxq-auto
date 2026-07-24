@@ -20,8 +20,8 @@ from .config import (
 )
 from .db import Database
 from .feishu import FeishuGateway, IncomingCommand
-from .messages import next_step
-from .site import PiaoxingqiuPage
+from .account_guidance import next_step
+from .purchase_page import PurchasePage
 
 
 SEND_CODE_PATH = "/pub/v5/send_verify_code"
@@ -210,7 +210,7 @@ class FeishuLoginManager:
         session.context_manager = manager
         page = context.pages[0] if context.pages else await context.new_page()
         session.page = page
-        site = PiaoxingqiuPage(page, config)
+        site = PurchasePage(page, config)
         await site.open_purchase()
         popup = page.locator(".global-login-popup:visible")
         login = await _wait_optional_unique(popup)
@@ -239,7 +239,7 @@ class FeishuLoginManager:
         await phone_input.fill(phone)
         agreement = await _wait_unique(step.locator(".agreement:visible"), "用户协议")
         if not await agreement.locator(".icon-xuanzhong").count():
-            await agreement.click()
+            await agreement.evaluate("element => element.click()")
         send = await _wait_unique(step.locator(".code-btn:visible"), "获取验证码按钮")
         await _require_text(send, "获取验证码登录", "获取验证码按钮")
         await _wait_enabled(send, "获取验证码按钮")
@@ -392,7 +392,7 @@ async def _click_for_result(page: Page, target: Locator, path: str) -> APIResult
     async with page.expect_response(
         lambda response: _matches(response, path), timeout=10_000
     ) as info:
-        await target.click()
+        await target.evaluate("element => element.click()")
     return await _read_result(await info.value)
 
 

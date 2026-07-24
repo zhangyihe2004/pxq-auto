@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from .notify import build_card
+from .feishu_cards import build_card
 
 log = logging.getLogger("pxq.feishu")
 

@@ -53,6 +53,8 @@ class PurchaseConfig:
     session: str
     plans: tuple[str, ...]
     plan_ids: tuple[str, ...]
+    quantity: int
+    real_name_mode: str
     audiences: tuple[AudienceConfig, ...]
 
 
@@ -64,7 +66,7 @@ class BrowserConfig:
 
 
 @dataclass(frozen=True)
-class AppConfig:
+class AccountRunConfig:
     project: ProjectConfig
     purchase: PurchaseConfig
     browser: BrowserConfig
@@ -83,6 +85,8 @@ class AppConfig:
                 self.purchase.session,
                 *self.purchase.plans,
                 *self.purchase.plan_ids,
+                str(self.purchase.quantity),
+                self.purchase.real_name_mode,
                 *(f"{a.name}|{a.masked_id}" for a in self.purchase.audiences),
             )
         )
@@ -152,21 +156,25 @@ def profile_key(phone: str) -> str:
 
 def build_order_config(
     task, plans, audiences, account, system: SystemConfig
-) -> AppConfig:
+) -> AccountRunConfig:
     if not plans:
         raise RuntimeError("账号尚未配置票档")
     people = tuple(
         AudienceConfig(person["name"], person["masked_id"]) for person in audiences
     )
-    if not people:
-        raise RuntimeError("账号尚未配置观演人")
+    quantity = int(account["quantity"])
+    required = required_audience_count(task["real_name_mode"], quantity)
+    if quantity < 1 or len(people) != required:
+        raise RuntimeError("账号数量或观演人配置不完整")
     home = account_home(account["profile_key"])
-    return AppConfig(
+    return AccountRunConfig(
         project=_project_config(task),
         purchase=PurchaseConfig(
             task["session_name"],
             tuple(plan["plan_name"] for plan in plans),
             tuple(plan["seat_plan_id"] for plan in plans),
+            quantity,
+            task["real_name_mode"],
             people,
         ),
         browser=BrowserConfig(
@@ -178,11 +186,13 @@ def build_order_config(
     )
 
 
-def build_login_config(task, account, system: SystemConfig) -> AppConfig:
+def build_login_config(task, account, system: SystemConfig) -> AccountRunConfig:
     home = account_home(account["profile_key"])
-    return AppConfig(
+    return AccountRunConfig(
         project=_project_config(task),
-        purchase=PurchaseConfig(task["session_name"], (), (), ()),
+        purchase=PurchaseConfig(
+            task["session_name"], (), (), 0, task["real_name_mode"], ()
+        ),
         browser=BrowserConfig(
             home / "browser-profile", True, system.browser_timeout_ms
         ),
@@ -223,3 +233,11 @@ def mask_id(value: str) -> str:
 
 def mask_phone(phone: str) -> str:
     return f"{phone[:3]}****{phone[-4:]}"
+
+
+def required_audience_count(mode: str, quantity: int) -> int:
+    if mode == "NONE":
+        return 0
+    if mode == "PER_ORDER":
+        return 1
+    return quantity

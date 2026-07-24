@@ -1,3 +1,5 @@
+"""任务轮询、账号调度和结果通知。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,20 +7,22 @@ import logging
 import time
 from dataclasses import dataclass
 
-from .api import PxqError
+from .public_api import PxqError
 from .auth import AuthGuard
 from .browser import persistent_browser
-from .config import AppConfig, SystemConfig, build_order_config
+from .config import AccountRunConfig, SystemConfig, build_order_config
 from .db import Database
 from .feishu import FeishuGateway
-from .guard import PersistentOrderGuard
-from .runner import RunResult, check_login, run_account
-from .service import (
+from .order_guard import PersistentOrderGuard
+from .checkout import RunResult, check_login, run_account
+from .sale_state import (
     ACTIVE_SESSION_STATUSES,
     PREWARM_SECONDS,
+    sale_phase,
+)
+from .task_service import (
     SessionUnavailable,
     TaskService,
-    sale_phase,
 )
 
 
@@ -40,7 +44,7 @@ class PendingNotice:
     error_alert: bool = False
 
 
-class AutoEngine:
+class TaskScheduler:
     def __init__(
         self,
         db: Database,
@@ -258,7 +262,8 @@ class AutoEngine:
                         f"任务 #{task_id}\n**{task['show_name']}**",
                         f"场次：{task['session_name']}",
                         *(
-                            f"· {plan['plan_name']}：{plan['can_buy_count']} 张"
+                            f"· {plan['plan_name']}：最多可买 "
+                            f"{plan['can_buy_count'] * plan['unit_qty']} 张"
                             for plan in available
                         ),
                     )
@@ -472,7 +477,12 @@ class AutoEngine:
                 return "账号状态竞争失败"
             try:
                 async with persistent_browser(config.browser) as context:
-                    result = await run_account(config, context, prewarm=prewarm)
+                    result = await run_account(
+                        config,
+                        context,
+                        prewarm=prewarm,
+                        trace_label=f"任务 #{task['id']}｜账号 #{account_id}",
+                    )
             except asyncio.CancelledError:
                 current = self.db.get_account(account_id)
                 if current:
@@ -513,7 +523,11 @@ class AutoEngine:
                         )
                 self._notify_result(account_id, task, result)
                 return result.status
-            self._apply_removed_audiences(account_id, result.removed_audiences)
+            self.db.apply_fulfillment(
+                account_id,
+                result.fulfilled_quantity,
+                result.removed_audiences,
+            )
             current = self.db.get_account(account_id)
             if current is None:
                 return "执行完成后账号已不存在"
@@ -572,8 +586,6 @@ class AutoEngine:
                 return
             plans = self.db.get_account_plans(account_id)
             people = self.db.get_audiences(account_id)
-            if not people:
-                return
             config = build_order_config(task, plans, people, account, self.system)
             try:
                 async with persistent_browser(config.browser) as context:
@@ -595,17 +607,12 @@ class AutoEngine:
                     ),
                 )
 
-    def _apply_removed_audiences(
-        self, account_id: int, removed: tuple[str, ...]
-    ) -> None:
-        self.db.remove_audiences(account_id, removed)
-
     def _notify_result(self, account_id: int, task, result: RunResult) -> None:
         title = {
             "CREATED": "订单已创建",
             "UNKNOWN": "订单结果未知",
             "NEEDS_LOGIN": "账号需要重新登录",
-            "COMPLETE": "观演人均已购",
+            "COMPLETE": "目标数量已完成",
         }.get(result.status, "抢票执行异常")
         color = "green" if result.status in {"CREATED", "COMPLETE"} else "orange"
         action = {
@@ -617,7 +624,7 @@ class AutoEngine:
                 f"下一步：检查票星球待支付订单；确认无订单后发送：重置 {account_id}"
             ),
             "NEEDS_LOGIN": f"下一步：登录 {task['id']}",
-            "COMPLETE": f"下一步：配置 {account_id}",
+            "COMPLETE": f"下一步：配置 {account_id}（设置新的目标数量）",
         }.get(result.status, "状态：账号保持启动，将自动继续等待。")
         body = (
             f"任务 #{task['id']}｜账号 #{account_id}\n"
@@ -681,7 +688,9 @@ class AutoEngine:
             await asyncio.gather(*activities, return_exceptions=True)
 
 
-def _protected_order_state(config: AppConfig) -> tuple[str, str | None] | None:
+def _protected_order_state(
+    config: AccountRunConfig,
+) -> tuple[str, str | None] | None:
     try:
         state = PersistentOrderGuard(config.state_path, config.plan_key).current()
     except RuntimeError:
